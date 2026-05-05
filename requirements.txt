@@ -1,0 +1,4 @@
+anthropic
+sounddevice
+numpy
+pyobjc-framework-Quartz
