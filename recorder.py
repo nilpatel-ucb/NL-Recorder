@@ -15,13 +15,6 @@ import datetime
 import sys
 
 try:
-    import numpy as np
-    import sounddevice as sd
-except ImportError:
-    print("Run setup.sh first, or: pip install sounddevice numpy")
-    sys.exit(1)
-
-try:
     import Quartz
     HAS_QUARTZ = True
 except ImportError:
@@ -87,24 +80,6 @@ def find_best_audio_device(devices):
     return 0, "Default", False
 
 
-def probe_capture_scale(screen_idx):
-    """Compare ffmpeg's actual capture resolution to Quartz logical coords to get the crop scale."""
-    if not HAS_QUARTZ:
-        return 1.0
-    try:
-        r = subprocess.run(
-            ["ffmpeg", "-f", "avfoundation", "-framerate", "1",
-             "-i", str(screen_idx), "-vframes", "1", "-f", "null", "-"],
-            capture_output=True, text=True, timeout=8
-        )
-        m = re.search(r"Video:.*?(\d{3,5})x(\d{3,5})", r.stderr)
-        if not m:
-            return 1.0
-        cap_w = int(m.group(1))
-        logical_w = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID()).size.width
-        return cap_w / logical_w if logical_w else 1.0
-    except Exception:
-        return 1.0
 
 
 def get_open_windows():
@@ -136,112 +111,59 @@ def get_open_windows():
     return wins
 
 
-def fuzzy_find_window(hint, windows):
-    h = hint.lower()
-    for w in windows:
-        if h == w["app"].lower():
-            return w
-    for w in windows:
-        if h in w["app"].lower():
-            return w
-    for w in windows:
-        if h in w["title"].lower():
-            return w
-    return None
-
-
-def check_audio_active(duration=1.2, threshold=0.003):
-    try:
-        rec = sd.rec(int(duration * 44100), samplerate=44100,
-                     channels=1, dtype="float32")
-        sd.wait()
-        level = float(np.abs(rec).mean())
-        return level > threshold, level
-    except Exception:
-        return False, 0.0
 
 
 # ─────────────────────────────────────────────
 #  INTENT PARSING
 # ─────────────────────────────────────────────
 
-def ollama_available():
-    try:
-        urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-def parse_intent_ollama(user_input):
+def ask_ollama(user_input, windows):
     now = datetime.datetime.now().strftime("%b%d_%H%M")
-    prompt = f"""Parse this screen recording request and return ONLY valid JSON, no explanation, no markdown fences.
 
-Request: "{user_input}"
+    window_list = "\n".join(
+        f"[{i}] {w['app']}" + (f" — {w['title']}" if w['title'] else "")
+        for i, w in enumerate(windows)
+    ) or "(none)"
 
-Return this exact JSON structure:
+    prompt = f"""You are controlling a screen recorder on macOS. The user said: "{user_input}"
+
+Open windows right now:
+{window_list}
+
+Reply with ONLY a JSON object, no explanation, no markdown:
 {{
-  "window_hint": "app or window name to search for, empty string for full screen",
-  "output_name": "snake_case filename no extension derived from the request plus timestamp",
-  "audio": "both",
-  "description": "one sentence plain English summary of what will be recorded"
+  "window_index": <number from the list that best matches, or -1 for full screen>,
+  "audio": "<system|mic|none>",
+  "output_name": "<short_snake_case_name_{now}>"
 }}
 
 Rules:
-- window_hint: lowercase app name like "zoom", "safari", "chrome", "slack" — or "" for full screen
-- output_name: short descriptive snake_case name + _{now} at the end
-- audio: "system" by default (captures what plays on screen); use "mic" only if user explicitly mentions mic/voice; "both" if they want mic AND system; "none" if silent/muted
-- Return ONLY the JSON object, nothing else.
-
-Timestamp to append: {now}"""
+- window_index: pick the window the user is talking about; use -1 only for full screen
+- audio: "system" by default; "mic" only if user explicitly says microphone/voice; "none" if silent
+- output_name: short snake_case description + _{now}"""
 
     payload = json.dumps({
         "model":  OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.1, "num_predict": 200}
+        "options": {"temperature": 0.1, "num_predict": 150},
     }).encode()
 
-    req  = urllib.request.Request(
+    req = urllib.request.Request(
         f"{OLLAMA_URL}/api/generate",
         data=payload,
         headers={"Content-Type": "application/json"},
-        method="POST"
+        method="POST",
     )
     with urllib.request.urlopen(req, timeout=20) as r:
         data = json.loads(r.read())
 
     text = data.get("response", "").strip()
-    # strip any accidental markdown fences
     text = re.sub(r"^```json\s*|^```\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
-    # extract first {...} block in case model adds commentary
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if m:
         text = m.group(0)
     return json.loads(text)
-
-
-def parse_intent_fallback(user_input):
-    now = datetime.datetime.now().strftime("%b%d_%H%M")
-    t = user_input.lower()
-    # web services that live in a browser — map to Chrome/Safari window hint
-    web_services = {"youtube": "chrome", "meet": "chrome", "gmail": "chrome",
-                    "notion": "chrome", "figma": "chrome", "netflix": "chrome"}
-    known_apps = ["zoom", "safari", "chrome", "firefox", "slack", "teams",
-                  "vscode", "terminal", "finder", "xcode", "discord", "spotify"]
-    hint = next((web_services[k] for k in web_services if k in t), None)
-    if hint is None:
-        hint = next((a for a in known_apps if a in t), "")
-    audio = ("none" if any(x in t for x in ["no audio", "silent", "mute"])
-              else "mic" if any(x in t for x in ["mic", "microphone", "my voice"])
-              else "system")
-    name = re.sub(r"[^a-z0-9_]", "", user_input[:30].replace(" ", "_").lower())
-    return {
-        "window_hint": hint,
-        "output_name": f"{name}_{now}",
-        "audio": audio,
-        "description": f"Recording {'full screen' if not hint else hint}",
-    }
 
 
 # ─────────────────────────────────────────────
@@ -298,7 +220,7 @@ class Recorder:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         if window and window.get("id") and HAS_QUARTZ:
             self._mode = "window"
-            self._start_window(window, output_name, audio_idx, has_audio, status_cb)
+            self._start_window(window, output_name, screen_idx, audio_idx, has_audio, status_cb)
         else:
             self._mode = "screen"
             self._start_screen(output_name, screen_idx, audio_idx, has_audio, status_cb)
@@ -370,14 +292,15 @@ class Recorder:
 
     # ── Window mode (Quartz frame pipe) ───────
 
-    def _start_window(self, window, output_name, audio_idx, has_audio, status_cb):
+    def _start_window(self, window, output_name, screen_idx, audio_idx, has_audio, status_cb):
         window_id = window["id"]
 
         # Probe dimensions with a test frame
         frame, w, h = capture_window_bgra(window_id)
         if not frame:
-            status_cb("⚠  Cannot capture window — using full screen instead")
+            status_cb("⚠  Cannot capture window — falling back to full screen")
             self._mode = "screen"
+            self._start_screen(output_name, screen_idx, audio_idx, has_audio, status_cb)
             return
 
         raw_video       = os.path.join(OUTPUT_DIR, f"_raw_video_{output_name}.mp4")
@@ -506,10 +429,9 @@ class App:
         self.is_recording = False
         self.recorder     = Recorder()
         self.intent       = None
-        self.audio_idx     = 0
-        self.screen_idx    = 1
-        self.capture_scale = 1.0
-        self._dot_running  = False
+        self.audio_idx    = 0
+        self.screen_idx   = 1
+        self._dot_running = False
 
         self.root.title("NL Recorder")
         self.root.geometry("400x335")
@@ -705,10 +627,9 @@ class App:
             vid_devs, aud_devs = get_ffmpeg_devices()
             sidx, _ = find_screen_device(vid_devs)
             self.screen_idx = sidx
-            self.capture_scale = probe_capture_scale(sidx)
             aidx, aname, is_sys = find_best_audio_device(aud_devs)
             self.audio_idx = aidx
-            label = f"{'System' if is_sys else 'Mic'}  ·  {aname}  ·  Screen [{sidx}] (scale {self.capture_scale:.1f}×)"
+            label = f"{'System' if is_sys else 'Mic'}  ·  {aname}"
             self._set_audio(True, label)
         except Exception:
             self._set_audio(False, "No audio device found")
@@ -730,52 +651,33 @@ class App:
         threading.Thread(target=self._start_worker, args=(text,), daemon=True).start()
 
     def _start_worker(self, user_input):
-        # 1 – parse
-        self._set_status("Parsing…")
+        # 1 – get windows and ask Ollama
+        self._set_status("Finding open windows…")
+        windows = get_open_windows()
+
+        self._set_status("Asking Ollama…")
         try:
-            if ollama_available():
-                try:
-                    self.intent = parse_intent_ollama(user_input)
-                except Exception as e:
-                    self._set_status(f"Ollama failed ({e}) — using built-in parser")
-                    self.intent = parse_intent_fallback(user_input)
-                    time.sleep(0.8)
-            else:
-                self._set_status("Ollama not running — using built-in parser")
-                self.intent = parse_intent_fallback(user_input)
+            result = ask_ollama(user_input, windows)
         except Exception as e:
-            self._set_status(f"⚠  {e}")
+            self._set_status(f"⚠  Ollama error: {e}")
             self.root.after(0, lambda: self.btn.config(state="normal", text="Record"))
             return
 
-        self._set_status(self.intent.get("description", ""))
+        # 2 – resolve window
+        idx    = result.get("window_index", -1)
+        window = windows[idx] if 0 <= idx < len(windows) else None
+
+        if window:
+            self._set_status(f"Window: {window['app']}  {window['w']}×{window['h']}")
+        else:
+            self._set_status("Full screen")
         time.sleep(0.3)
 
-        # 2 – find window
-        window = None
-        hint = self.intent.get("window_hint", "").strip()
-        if hint:
-            wins   = get_open_windows()
-            window = fuzzy_find_window(hint, wins)
-            if window:
-                self._set_status(f"Window found  ·  {window['app']}  {window['w']}×{window['h']}  (scale {self.capture_scale:.1f}×)")
-            else:
-                self._set_status(f"'{hint}' not found — using full screen")
-            time.sleep(0.4)
+        # 3 – record
+        has_audio  = result.get("audio", "system") != "none"
+        name       = result.get("output_name", f"recording_{datetime.datetime.now().strftime('%b%d_%H%M')}")
+        self.intent = {"output_name": name}
 
-        # 3 – audio check
-        has_audio = self.intent.get("audio", "both") != "none"
-        if has_audio:
-            self._set_status("Checking audio…")
-            ok, level = check_audio_active()
-            if ok:
-                self._set_audio(True, f"Audio active  ·  level {level:.4f}")
-            else:
-                self._set_audio(False, "Low audio signal — mic muted?")
-            time.sleep(0.4)
-
-        # 4 – record
-        name = self.intent.get("output_name", "recording")
         self.recorder.start(window, name, self.screen_idx, self.audio_idx, has_audio, self._set_status)
         self.is_recording = True
         self._blink_start()
@@ -811,13 +713,6 @@ class App:
 # ─────────────────────────────────────────────
 
 def preflight():
-    missing = []
-    for pkg in ("sounddevice", "numpy"):
-        try: __import__(pkg)
-        except ImportError: missing.append(pkg)
-    if missing:
-        print(f"Missing packages: {', '.join(missing)}\nRun: pip install {' '.join(missing)}")
-        sys.exit(1)
     if subprocess.run(["which", "ffmpeg"], capture_output=True).returncode != 0:
         print("ffmpeg not found.\nInstall with: brew install ffmpeg")
         sys.exit(1)
