@@ -433,13 +433,19 @@ class App:
         self.screen_idx   = 1
         self._dot_running = False
 
+        self._mic_muted      = False
+        self._vol_muted      = False
+        self._prev_mic_vol   = 69
+        self._audio_is_sys   = False  # True if audio device is BlackHole/system, not mic
+
         self.root.title("NL Recorder")
-        self.root.geometry("400x335")
+        self.root.geometry("400x385")
         self.root.resizable(False, False)
         self.root.configure(bg=self.BG)
 
         self._build()
         threading.Thread(target=self._probe_audio, daemon=True).start()
+        threading.Thread(target=self._init_audio_state, daemon=True).start()
 
     # ── Build UI ──────────────────────────────
 
@@ -503,6 +509,30 @@ class App:
                              bg=self.BG, fg=self.MUTED,
                              font=("Helvetica Neue", 10))
         self.albl.pack(side="left", padx=5)
+
+        # ── Mic / Volume toggles
+        ctrl_row = tk.Frame(self.root, bg=self.BG)
+        ctrl_row.pack(fill="x", padx=22, pady=(8, 0))
+
+        self.mic_btn = tk.Button(
+            ctrl_row, text="Mic  ON",
+            bg=self.SURFACE, fg=self.GREEN,
+            activebackground="#252525", activeforeground=self.TEXT,
+            font=("Helvetica Neue", 10, "bold"),
+            bd=0, relief="flat", cursor="hand2",
+            pady=7, command=self._toggle_mic
+        )
+        self.mic_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        self.vol_btn = tk.Button(
+            ctrl_row, text="Sound  ON",
+            bg=self.SURFACE, fg=self.GREEN,
+            activebackground="#252525", activeforeground=self.TEXT,
+            font=("Helvetica Neue", 10, "bold"),
+            bd=0, relief="flat", cursor="hand2",
+            pady=7, command=self._toggle_volume
+        )
+        self.vol_btn.pack(side="left", fill="x", expand=True)
 
         # ── Button
         self.btn = tk.Button(
@@ -628,11 +658,84 @@ class App:
             sidx, _ = find_screen_device(vid_devs)
             self.screen_idx = sidx
             aidx, aname, is_sys = find_best_audio_device(aud_devs)
-            self.audio_idx = aidx
-            label = f"{'System' if is_sys else 'Mic'}  ·  {aname}"
-            self._set_audio(True, label)
+            self.audio_idx     = aidx
+            self._audio_is_sys = is_sys
+            if is_sys:
+                label = f"System  ·  {aname}"
+                self._set_audio(True, label)
+            else:
+                label = f"Mic only  ·  {aname}  (install BlackHole for system audio)"
+                self._set_audio(False, label)
         except Exception:
             self._set_audio(False, "No audio device found")
+
+    # ── Mic / Volume controls ─────────────────
+
+    def _init_audio_state(self):
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", "get volume settings"],
+                capture_output=True, text=True, timeout=3
+            )
+            line = r.stdout.strip()
+            muted_m = re.search(r"output muted:(\w+)", line)
+            mic_m   = re.search(r"input volume:(\d+)", line)
+            if muted_m:
+                self._vol_muted = muted_m.group(1) == "true"
+            if mic_m:
+                vol = int(mic_m.group(1))
+                self._prev_mic_vol = vol if vol > 0 else 69
+                self._mic_muted = (vol == 0)
+        except Exception:
+            pass
+        self.root.after(0, self._update_mute_buttons)
+
+    def _toggle_mic(self):
+        try:
+            if self._mic_muted:
+                subprocess.run(
+                    ["osascript", "-e", f"set volume input volume {self._prev_mic_vol}"],
+                    capture_output=True, timeout=3
+                )
+                self._mic_muted = False
+            else:
+                r = subprocess.run(
+                    ["osascript", "-e", "input volume of (get volume settings)"],
+                    capture_output=True, text=True, timeout=3
+                )
+                vol = int(r.stdout.strip())
+                if vol > 0:
+                    self._prev_mic_vol = vol
+                subprocess.run(
+                    ["osascript", "-e", "set volume input volume 0"],
+                    capture_output=True, timeout=3
+                )
+                self._mic_muted = True
+        except Exception:
+            pass
+        self._update_mute_buttons()
+
+    def _toggle_volume(self):
+        try:
+            self._vol_muted = not self._vol_muted
+            val = "true" if self._vol_muted else "false"
+            subprocess.run(
+                ["osascript", "-e", f"set volume output muted {val}"],
+                capture_output=True, timeout=3
+            )
+        except Exception:
+            pass
+        self._update_mute_buttons()
+
+    def _update_mute_buttons(self):
+        self.mic_btn.config(
+            text="Mic  OFF" if self._mic_muted else "Mic  ON",
+            fg=self.RED if self._mic_muted else self.GREEN
+        )
+        self.vol_btn.config(
+            text="Sound  OFF" if self._vol_muted else "Sound  ON",
+            fg=self.RED if self._vol_muted else self.GREEN
+        )
 
     # ── Record / Stop ─────────────────────────
 
@@ -674,7 +777,11 @@ class App:
         time.sleep(0.3)
 
         # 3 – record
-        has_audio  = result.get("audio", "system") != "none"
+        has_audio = result.get("audio", "system") != "none"
+        # Mic mute button: if mic is off and the audio device is a mic (not system audio), skip audio
+        if has_audio and self._mic_muted and not self._audio_is_sys:
+            has_audio = False
+            self._set_status("⚠  Mic is off and no system audio device found — recording without audio")
         name       = result.get("output_name", f"recording_{datetime.datetime.now().strftime('%b%d_%H%M')}")
         self.intent = {"output_name": name}
 
