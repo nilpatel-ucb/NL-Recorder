@@ -125,6 +125,7 @@ def get_open_windows():
             app = w.get("kCGWindowOwnerName", "")
             if app and width > 100 and height > 100:
                 wins.append({
+                    "id":    w.get("kCGWindowNumber", 0),
                     "app":   app,
                     "title": w.get("kCGWindowName", ""),
                     "x": int(b.get("X", 0)), "y": int(b.get("Y", 0)),
@@ -244,57 +245,97 @@ def parse_intent_fallback(user_input):
 
 
 # ─────────────────────────────────────────────
+#  WINDOW FRAME CAPTURE (Quartz direct)
+# ─────────────────────────────────────────────
+
+def capture_window_bgra(window_id):
+    """Return (bgra_bytes, width, height) for a specific window via Quartz."""
+    cg_img = Quartz.CGWindowListCreateImage(
+        Quartz.CGRectNull,
+        Quartz.kCGWindowListOptionIncludingWindow | Quartz.kCGWindowListExcludeDesktopElements,
+        window_id,
+        Quartz.kCGWindowImageBoundsIgnoreFraming | Quartz.kCGWindowImageNominalResolution,
+    )
+    if not cg_img:
+        return None, 0, 0
+
+    w = Quartz.CGImageGetWidth(cg_img)
+    h = Quartz.CGImageGetHeight(cg_img)
+    w -= w % 2
+    h -= h % 2
+
+    cs  = Quartz.CGColorSpaceCreateDeviceRGB()
+    ctx = Quartz.CGBitmapContextCreate(
+        None, w, h, 8, w * 4, cs,
+        Quartz.kCGBitmapByteOrder32Little | Quartz.kCGImageAlphaPremultipliedFirst,
+    )
+    if not ctx:
+        return None, w, h
+
+    Quartz.CGContextDrawImage(ctx, Quartz.CGRectMake(0, 0, w, h), cg_img)
+    out_img = Quartz.CGBitmapContextCreateImage(ctx)
+    raw     = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(out_img))
+    return bytes(raw), w, h
+
+
+# ─────────────────────────────────────────────
 #  RECORDER ENGINE
 # ─────────────────────────────────────────────
 
 class Recorder:
     def __init__(self):
-        self.process  = None
-        self.raw_path = None
+        self.process      = None
+        self.audio_proc   = None
+        self.raw_path     = None
+        self._raw_audio   = None
+        self._stop_evt    = None
+        self._vid_thread  = None
+        self._mode        = "screen"
 
-    def start(self, window, output_name, screen_idx, audio_idx, has_audio, capture_scale, status_cb):
+    # ── Public API ────────────────────────────
+
+    def start(self, window, output_name, screen_idx, audio_idx, has_audio, status_cb):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        self.raw_path = os.path.join(OUTPUT_DIR, f"_raw_{output_name}.mov")
+        if window and window.get("id") and HAS_QUARTZ:
+            self._mode = "window"
+            self._start_window(window, output_name, audio_idx, has_audio, status_cb)
+        else:
+            self._mode = "screen"
+            self._start_screen(output_name, screen_idx, audio_idx, has_audio, status_cb)
 
+    def stop_and_compress(self, output_name, status_cb, done_cb):
+        if self._mode == "window":
+            self._stop_window(output_name, status_cb, done_cb)
+        else:
+            self._stop_screen(output_name, status_cb, done_cb)
+
+    # ── Screen mode (avfoundation) ─────────────
+
+    def _start_screen(self, output_name, screen_idx, audio_idx, has_audio, status_cb):
+        self.raw_path = os.path.join(OUTPUT_DIR, f"_raw_{output_name}.mov")
         av_input = f"{screen_idx}:{audio_idx}" if has_audio else str(screen_idx)
 
         cmd = [
-            "ffmpeg", "-y",
-            "-f", "avfoundation",
-            "-framerate", "30",
-            "-capture_cursor", "1",
+            "ffmpeg", "-y", "-f", "avfoundation",
+            "-framerate", "30", "-capture_cursor", "1",
             "-i", av_input,
         ]
-
-        if window:
-            scale = capture_scale
-            x = int(window["x"] * scale)
-            y = int(window["y"] * scale)
-            w = int(window["w"] * scale)
-            h = int(window["h"] * scale)
-            w -= w % 2
-            h -= h % 2
-            cmd += ["-vf", f"crop={w}:{h}:{x}:{y}"]
-
         cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18"]
-
         if has_audio:
             cmd += ["-c:a", "aac", "-b:a", "192k"]
         else:
             cmd += ["-an"]
-
         cmd.append(self.raw_path)
 
         self.process = subprocess.Popen(
             cmd, stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        status_cb(f"▶  Recording  ·  {output_name}")
+        status_cb(f"▶  Recording screen  ·  {output_name}")
 
-    def stop_and_compress(self, output_name, status_cb, done_cb):
+    def _stop_screen(self, output_name, status_cb, done_cb):
         if not self.process:
             done_cb(None); return
-
         try:
             self.process.stdin.write(b"q")
             self.process.stdin.flush()
@@ -303,20 +344,17 @@ class Recorder:
         self.process.wait()
 
         status_cb("Compressing…")
-
         if not self.raw_path or not os.path.exists(self.raw_path):
             status_cb("⚠  Output file missing.")
             done_cb(None); return
 
         raw_mb   = os.path.getsize(self.raw_path) / 1_048_576
         out_path = os.path.join(OUTPUT_DIR, f"{output_name}.mp4")
-
-        result = subprocess.run([
+        result   = subprocess.run([
             "ffmpeg", "-y", "-i", self.raw_path,
             "-c:v", "libx264", "-preset", "slow", "-crf", "28",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            out_path
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+            out_path,
         ], capture_output=True)
 
         if result.returncode == 0 and os.path.exists(out_path):
@@ -329,6 +367,124 @@ class Recorder:
             os.rename(self.raw_path, fallback)
             status_cb(f"✓  Saved (uncompressed)  ·  {output_name}.mov")
             done_cb(fallback)
+
+    # ── Window mode (Quartz frame pipe) ───────
+
+    def _start_window(self, window, output_name, audio_idx, has_audio, status_cb):
+        window_id = window["id"]
+
+        # Probe dimensions with a test frame
+        frame, w, h = capture_window_bgra(window_id)
+        if not frame:
+            status_cb("⚠  Cannot capture window — using full screen instead")
+            self._mode = "screen"
+            return
+
+        raw_video       = os.path.join(OUTPUT_DIR, f"_raw_video_{output_name}.mp4")
+        self.raw_path   = raw_video
+        self._raw_audio = None
+
+        # Video: raw BGRA frames piped into ffmpeg
+        self.process = subprocess.Popen([
+            "ffmpeg", "-y",
+            "-f", "rawvideo", "-pix_fmt", "bgra",
+            "-s", f"{w}x{h}", "-r", "30",
+            "-i", "pipe:0",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            raw_video,
+        ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Audio: separate avfoundation capture → temp AAC file
+        if has_audio:
+            raw_audio       = os.path.join(OUTPUT_DIR, f"_raw_audio_{output_name}.aac")
+            self._raw_audio = raw_audio
+            self.audio_proc = subprocess.Popen([
+                "ffmpeg", "-y",
+                "-f", "avfoundation", "-i", f":{audio_idx}",
+                "-c:a", "aac", "-b:a", "192k",
+                raw_audio,
+            ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Frame capture loop in a background thread
+        self._stop_evt = threading.Event()
+
+        def _capture_loop():
+            fps        = 30
+            frame_time = 1.0 / fps
+            while not self._stop_evt.is_set():
+                t0         = time.time()
+                data, fw, fh = capture_window_bgra(window_id)
+                if data and fw == w and fh == h:
+                    try:
+                        self.process.stdin.write(data)
+                    except (BrokenPipeError, OSError):
+                        break
+                sleep_t = frame_time - (time.time() - t0)
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+
+        self._vid_thread = threading.Thread(target=_capture_loop, daemon=True)
+        self._vid_thread.start()
+        status_cb(f"▶  Recording window  ·  {w}×{h}  ·  {output_name}")
+
+    def _stop_window(self, output_name, status_cb, done_cb):
+        # Stop frame loop
+        if self._stop_evt:
+            self._stop_evt.set()
+        if self._vid_thread:
+            self._vid_thread.join(timeout=2)
+
+        # Close video ffmpeg
+        if self.process:
+            try:
+                self.process.stdin.close()
+            except OSError:
+                pass
+            self.process.wait()
+
+        # Stop audio ffmpeg
+        if self.audio_proc:
+            try:
+                self.audio_proc.stdin.write(b"q")
+                self.audio_proc.stdin.flush()
+            except Exception:
+                self.audio_proc.terminate()
+            self.audio_proc.wait()
+
+        status_cb("Merging & compressing…")
+
+        raw_video = os.path.join(OUTPUT_DIR, f"_raw_video_{output_name}.mp4")
+        out_path  = os.path.join(OUTPUT_DIR, f"{output_name}.mp4")
+
+        if not os.path.exists(raw_video):
+            status_cb("⚠  No video output created.")
+            done_cb(None); return
+
+        merge_cmd = [
+            "ffmpeg", "-y", "-i", raw_video,
+        ]
+        if self._raw_audio and os.path.exists(self._raw_audio):
+            merge_cmd += ["-i", self._raw_audio]
+        merge_cmd += [
+            "-c:v", "libx264", "-preset", "slow", "-crf", "28",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", "-shortest",
+            out_path,
+        ]
+
+        result = subprocess.run(merge_cmd, capture_output=True)
+        for f in [raw_video, self._raw_audio]:
+            if f and os.path.exists(f):
+                os.remove(f)
+
+        if result.returncode == 0 and os.path.exists(out_path):
+            final_mb = os.path.getsize(out_path) / 1_048_576
+            status_cb(f"✓  {final_mb:.1f} MB  ·  {output_name}.mp4")
+            done_cb(out_path)
+        else:
+            status_cb("⚠  Merge failed — check ffmpeg logs.")
+            done_cb(None)
 
 
 # ─────────────────────────────────────────────
@@ -356,7 +512,7 @@ class App:
         self._dot_running  = False
 
         self.root.title("NL Recorder")
-        self.root.geometry("400x310")
+        self.root.geometry("400x335")
         self.root.resizable(False, False)
         self.root.configure(bg=self.BG)
 
@@ -401,9 +557,21 @@ class App:
         self.entry.bind("<FocusOut>", self._focus_out)
         self.entry.bind("<Return>",   lambda _: self._action())
 
+        # ── Windows hint row
+        wrow = tk.Frame(self.root, bg=self.BG)
+        wrow.pack(fill="x", padx=22, pady=(6, 0))
+
+        tk.Button(
+            wrow, text="Show open windows",
+            bg=self.BG, fg=self.MUTED,
+            activebackground=self.BG, activeforeground=self.TEXT,
+            font=("Helvetica Neue", 10), bd=0, relief="flat",
+            cursor="hand2", command=self._show_windows
+        ).pack(side="left")
+
         # ── Audio row
         arow = tk.Frame(self.root, bg=self.BG)
-        arow.pack(fill="x", padx=22, pady=(11, 0))
+        arow.pack(fill="x", padx=22, pady=(4, 0))
 
         self.adot = tk.Label(arow, text="●", bg=self.BG, fg=self.MUTED,
                              font=("Helvetica Neue", 9))
@@ -444,6 +612,67 @@ class App:
         if not self.entry.get().strip():
             self.entry.insert(0, "e.g.  record the Zoom window")
             self.entry.config(fg=self.MUTED)
+
+    def _show_windows(self):
+        wins = get_open_windows()
+
+        popup = tk.Toplevel(self.root)
+        popup.title("Open Windows")
+        popup.configure(bg=self.BG)
+        popup.resizable(False, False)
+
+        # position near main window
+        x = self.root.winfo_x() + self.root.winfo_width() + 8
+        y = self.root.winfo_y()
+        popup.geometry(f"320x{min(40 + len(wins) * 36, 400)}+{x}+{y}")
+
+        if not wins:
+            tk.Label(popup, text="No windows detected",
+                     bg=self.BG, fg=self.MUTED,
+                     font=("Helvetica Neue", 11)).pack(pady=20)
+            return
+
+        # deduplicate by app name, keeping largest window per app
+        by_app = {}
+        for w in wins:
+            app = w["app"]
+            if app not in by_app or w["w"] * w["h"] > by_app[app]["w"] * by_app[app]["h"]:
+                by_app[app] = w
+
+        frame = tk.Frame(popup, bg=self.BG)
+        frame.pack(fill="both", expand=True, padx=12, pady=10)
+
+        def pick(app_name):
+            self.entry.delete(0, "end")
+            self.entry.config(fg=self.TEXT)
+            self.entry.insert(0, f"record the {app_name} window")
+            popup.destroy()
+            self.entry.focus_set()
+
+        for w in sorted(by_app.values(), key=lambda x: x["app"]):
+            row = tk.Frame(frame, bg=self.SURFACE, cursor="hand2")
+            row.pack(fill="x", pady=2)
+
+            title = w["title"] or w["app"]
+            if len(title) > 34:
+                title = title[:31] + "…"
+
+            tk.Label(row, text=w["app"], bg=self.SURFACE, fg=self.TEXT,
+                     font=("Helvetica Neue", 11, "bold"),
+                     anchor="w").pack(side="left", padx=(10, 4), pady=6)
+            tk.Label(row, text=title if title != w["app"] else "",
+                     bg=self.SURFACE, fg=self.MUTED,
+                     font=("Helvetica Neue", 10),
+                     anchor="w").pack(side="left", pady=6)
+            tk.Label(row, text=f"{w['w']}×{w['h']}",
+                     bg=self.SURFACE, fg=self.MUTED,
+                     font=("Helvetica Neue", 9),
+                     anchor="e").pack(side="right", padx=10, pady=6)
+
+            app_name = w["app"]
+            for widget in (row,) + tuple(row.winfo_children()):
+                widget.bind("<Button-1>", lambda _, a=app_name: pick(a))
+                widget.config(cursor="hand2")
 
     def _set_status(self, msg):
         self.root.after(0, lambda: self.status_var.set(msg))
@@ -547,7 +776,7 @@ class App:
 
         # 4 – record
         name = self.intent.get("output_name", "recording")
-        self.recorder.start(window, name, self.screen_idx, self.audio_idx, has_audio, self.capture_scale, self._set_status)
+        self.recorder.start(window, name, self.screen_idx, self.audio_idx, has_audio, self._set_status)
         self.is_recording = True
         self._blink_start()
 
