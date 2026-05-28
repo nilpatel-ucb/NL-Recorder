@@ -8,6 +8,9 @@ Minimal macOS screen recorder controlled with plain English. Uses **Ollama** (lo
 "record my screen"              → full screen + mic
 "record the doctor meeting"     → saves as doctor_meeting_May3.mp4
 ```
+## Main Motive
+
+Built this as an app to make it easier for my dad to be able to screen record videos on his Mac, as solutions such as OBS and the built-in screen recorder were complicated. I re-envisioned the screen recorder using Natural Language as an input.  
 
 ## Setup
 
