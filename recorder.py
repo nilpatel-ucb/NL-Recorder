@@ -4,16 +4,34 @@ NL Screen Recorder for macOS
 Natural language → screen recording with audio verification + auto-compression
 """
 
+#imports the UI which gives us the window/buttons
 import tkinter as tk
+
+#allows mutliple tasks to run at the same time
 import threading
+
+#lets python run terminal commands
 import subprocess
+
+#used for creating folders within the OS
 import os
+
+#for parsing text regx
 import re
+
+#converts from json object to python and vice versa 
 import json
+
+#fxns dealing w time to slowdown/have fxns wait
 import time
+
+#human readable date/times
 import datetime
+
+#extracts system info from terminal (command line arguments)
 import sys
 
+#macos only system which mainly used for finding windows
 try:
     import Quartz
     HAS_QUARTZ = True
@@ -21,6 +39,8 @@ except ImportError:
     HAS_QUARTZ = False
 
 import urllib.request
+
+#for when ollama isn't running
 import urllib.error
 
 OLLAMA_URL   = os.environ.get("OLLAMA_URL", "http://localhost:11434")
