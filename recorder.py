@@ -52,6 +52,7 @@ OUTPUT_DIR   = os.path.expanduser("~/Movies/NLRecorder")
 #  SYSTEM UTILITIES
 # ─────────────────────────────────────────────
 
+#makes dictionaries on what screens/mics are avaliable
 def get_ffmpeg_devices():
     result = subprocess.run(
         ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
@@ -59,6 +60,12 @@ def get_ffmpeg_devices():
     )
     video, audio = {}, {}
     section = None
+    #AVfoundation is the apple framework that gives us access to the window/camera/mic
+
+    #Typical result.stderr.split output
+    #[AVFoundation input device @ 0x600003b240a0] AVFoundation video devices:
+    #[AVFoundation input device @ 0x600003b240a0] [0] FaceTime HD Camera
+    #[AVFoundation input device @ 0x600003b240a0] [1] OBS Virtual Camera
     for line in result.stderr.split("\n"):
         if "AVFoundation video devices" in line:
             section = "video"
@@ -74,9 +81,11 @@ def get_ffmpeg_devices():
 
 
 def find_screen_device(video_devices):
-    for idx, name in video_devices.items():
+    #goes through key, value pair in dictionary with all the devices
+    "Input (video_devices): dict"
+    for id, name in video_devices.items():
         if any(k in name.lower() for k in ["screen", "capture", "display"]):
-            return idx, name
+            return id, name
     # safe default on most Macs — index 1 is usually the screen
     return 1, "Screen (assumed)"
 
@@ -88,6 +97,7 @@ def get_ffmpeg_audio_devices():
 
 
 def find_best_audio_device(devices):
+    #finds best ouut of the aduio decives inputed
     for idx, name in devices.items():
         if "blackhole" in name.lower() or "loopback" in name.lower():
             return idx, name, True   # system audio
@@ -103,6 +113,7 @@ def find_best_audio_device(devices):
 
 
 def get_open_windows():
+    "Return: list of dictionary one per window with id, what windo it is, its title, and width, height, position"
     if not HAS_QUARTZ:
         return []
     wins = []
@@ -131,19 +142,99 @@ def get_open_windows():
     return wins
 
 
+BROWSER_APPS = {"Google Chrome", "Chrome", "Chromium", "Microsoft Edge", "Safari"}
+
+def get_chrome_tabs():
+    """Use AppleScript to get all tab titles per Chrome window (front-to-back order).
+    Returns a list of lists: [[tab1, tab2, ...], [tab1, ...], ...]"""
+    script = """
+tell application "Google Chrome"
+    set output to ""
+    repeat with w in windows
+        set row to ""
+        repeat with t in tabs of w
+            if row is not "" then set row to row & "|||"
+            set row to row & (title of t)
+        end repeat
+        if output is not "" then set output to output & "\n"
+        set output to output & row
+    end repeat
+    return output
+end tell
+"""
+    try:
+        r = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0 or not r.stdout.strip():
+            return []
+        return [
+            [t.strip() for t in line.split("|||") if t.strip()]
+            for line in r.stdout.strip().split("\n")
+        ]
+    except Exception:
+        return []
+
+
+def enrich_windows_with_tabs(windows):
+    """Add a 'tabs' list and '_chrome_win_num' to Chrome windows so Ollama can see all open tabs."""
+    chrome_indices = [i for i, w in enumerate(windows) if w["app"] in BROWSER_APPS]
+    if not chrome_indices:
+        return windows
+    tab_data = get_chrome_tabs()
+    for as_num, win_idx in enumerate(chrome_indices):
+        if as_num < len(tab_data):
+            windows[win_idx]["tabs"]           = tab_data[as_num]
+            windows[win_idx]["_chrome_win_num"] = as_num + 1  # 1-based for AppleScript
+    return windows
+
+
+def activate_chrome_tab(chrome_win_num, tab_title):
+    """Switch Chrome to a specific tab by title, then bring Chrome to front."""
+    safe = tab_title.replace('"', '\\"')[:60]
+    script = f"""
+tell application "Google Chrome"
+    set w to window {chrome_win_num}
+    set n to 0
+    repeat with t in tabs of w
+        set n to n + 1
+        if title of t contains "{safe}" then
+            set active tab index of w to n
+            exit repeat
+        end if
+    end repeat
+    activate
+end tell
+"""
+    subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+
+
 
 
 # ─────────────────────────────────────────────
-#  INTENT PARSING
+#  INTENT PARSING POWERD BY OLLAMA
 # ─────────────────────────────────────────────
 
 def ask_ollama(user_input, windows):
+    "Input: takes in user_input string, and windows we previously parsed"
+    "Ouput: returns JSON file with what window index and audio we need to be using."
+
+    """JSON EX: {
+        "window_index": 2,
+        "audio": "system",
+        "output_name": "youtube_Jun08_1430"
+                }"""
+
     now = datetime.datetime.now().strftime("%b%d_%H%M")
 
-    window_list = "\n".join(
-        f"[{i}] {w['app']}" + (f" — {w['title']}" if w['title'] else "")
-        for i, w in enumerate(windows)
-    ) or "(none)"
+    def fmt_window(i, w):
+        line = f"[{i}] {w['app']}"
+        if w.get("tabs"):
+            line += f" (tabs: {' | '.join(w['tabs'][:8])})"
+        elif w.get("title"):
+            line += f" — {w['title']}"
+        return line
+
+    window_list = "\n".join(fmt_window(i, w) for i, w in enumerate(windows)) or "(none)"
 
     prompt = f"""You are controlling a screen recorder on macOS. The user said: "{user_input}"
 
@@ -153,12 +244,14 @@ Open windows right now:
 Reply with ONLY a JSON object, no explanation, no markdown:
 {{
   "window_index": <number from the list that best matches, or -1 for full screen>,
+  "tab_title": <exact tab title string if targeting a specific browser tab, otherwise null>,
   "audio": "<system|mic|none>",
   "output_name": "<short_snake_case_name_{now}>"
 }}
 
 Rules:
 - window_index: pick the window the user is talking about; use -1 only for full screen
+- tab_title: if the window is a browser and the user wants a specific tab, put the exact tab title; else null
 - audio: "system" by default; "mic" only if user explicitly says microphone/voice; "none" if silent
 - output_name: short snake_case description + _{now}"""
 
@@ -166,7 +259,7 @@ Rules:
         "model":  OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.1, "num_predict": 150},
+        "options": {"temperature": 0.1, "num_predict": 200},
     }).encode()
 
     req = urllib.request.Request(
@@ -774,9 +867,10 @@ class App:
         threading.Thread(target=self._start_worker, args=(text,), daemon=True).start()
 
     def _start_worker(self, user_input):
-        # 1 – get windows and ask Ollama
+        #acc starts
+        # 1 – get windows (enriched with all browser tabs) and ask Ollama
         self._set_status("Finding open windows…")
-        windows = get_open_windows()
+        windows = enrich_windows_with_tabs(get_open_windows())
 
         self._set_status("Asking Ollama…")
         try:
@@ -786,9 +880,15 @@ class App:
             self.root.after(0, lambda: self.btn.config(state="normal", text="Record"))
             return
 
-        # 2 – resolve window
+        # 2 – resolve window; activate the right browser tab if specified
         idx    = result.get("window_index", -1)
         window = windows[idx] if 0 <= idx < len(windows) else None
+
+        tab_title = result.get("tab_title")
+        if tab_title and window and window.get("_chrome_win_num"):
+            self._set_status(f"Switching to tab: {tab_title[:50]}…")
+            activate_chrome_tab(window["_chrome_win_num"], tab_title)
+            time.sleep(0.5)  # give Chrome time to bring the tab to front
 
         if window:
             self._set_status(f"Window: {window['app']}  {window['w']}×{window['h']}")
