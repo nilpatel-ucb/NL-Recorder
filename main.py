@@ -7,17 +7,22 @@ Deps: pip install pyqt6   (ffmpeg must be installed: brew install ffmpeg)
 
 import sys
 import os
+import re
 import subprocess
 import datetime
+import tempfile
 import threading
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem,
-    QFrame, QSizePolicy, QFileDialog, QMessageBox
+    QMessageBox
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QColor, QPalette, QFont, QIcon, QPixmap, QPainter, QBrush
+
+
+PREV_W = 640  # target width for preview scaling
 
 
 # ─── Palette ────────────────────────────────────────────────────────────────
@@ -117,7 +122,7 @@ QLabel#previewPlaceholder {{
     letter-spacing: 1px;
 }}
 
-QWidget#previewCanvas {{
+QLabel#previewImage {{
     background: #141414;
     border: 1px solid #222222;
     border-radius: 4px;
@@ -282,12 +287,79 @@ class TimelineBar(QWidget):
             p.fillRect(0, 0, w, self.height(), QColor(ACCENT_BLUE))
 
 
+# ─── Live preview worker ─────────────────────────────────────────────────────
+#the segment which allows the preview video to get a live feed
+class LivePreviewThread(QThread):
+    """Streams screen frames via ffmpeg mjpeg pipe at ~15 fps.
+
+    Uses mjpeg instead of rawvideo so each JPEG frame is self-delimiting —
+    no frame-size calculation needed, immune to resolution mismatches.
+    """
+    frame_ready = pyqtSignal(QPixmap)
+
+    def __init__(self, screen_idx: str = "1"):
+        super().__init__()
+        self._screen_idx = screen_idx
+        self._stop_flag  = threading.Event()
+
+    def run(self):
+        cmd = [
+            "ffmpeg",
+            "-f", "avfoundation",
+            "-framerate", "15",
+            "-capture_cursor", "1",
+            "-i", f"{self._screen_idx}:",
+            "-vf", f"scale={PREV_W}:-2",   # width fixed, height auto (must be even)
+            "-f", "mjpeg",
+            "-q:v", "7",
+            "-an",
+            "pipe:1",
+        ]
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            buf = b""
+            while not self._stop_flag.is_set():
+                chunk = proc.stdout.read(32768)
+                if not chunk:
+                    break
+                buf += chunk
+                # Extract complete JPEG frames: SOI = ff d8 … EOI = ff d9
+                while True:
+                    start = buf.find(b'\xff\xd8')
+                    if start == -1:
+                        buf = b""
+                        break
+                    end = buf.find(b'\xff\xd9', start + 2)
+                    if end == -1:
+                        buf = buf[start:]
+                        break
+                    jpeg = buf[start:end + 2]
+                    buf  = buf[end + 2:]
+                    px = QPixmap()
+                    px.loadFromData(jpeg, "JPEG")
+                    if not px.isNull():
+                        self.frame_ready.emit(px)
+        except Exception:
+            pass
+        finally:
+            if proc:
+                try:
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    pass
+
+    def stop(self):
+        self._stop_flag.set()
+
+
 # ─── Recording worker ────────────────────────────────────────────────────────
 
 class RecordWorker(QThread):
     """Runs ffmpeg in a background thread."""
-    finished = pyqtSignal(str)   # emits output file path
-    error    = pyqtSignal(str)   # emits error message
+    finished = pyqtSignal(str)
+    error    = pyqtSignal(str)
 
     def __init__(self, output_path: str, mic: bool, sys_audio: bool):
         super().__init__()
@@ -297,69 +369,70 @@ class RecordWorker(QThread):
         self._proc       = None
         self._stop       = threading.Event()
 
-    def run(self):
-        """Build ffmpeg command and start recording."""
-        # avfoundation device indices on macOS:
-        #   video: "1" = screen capture (Capture screen 0)
-        #   audio: "0" = default mic, "2" = system audio (BlackHole etc.)
-        #
-        # Adjust device indices if needed — run:
-        #   ffmpeg -f avfoundation -list_devices true -i ""
-        # to list your available devices.
+    @staticmethod
+    def _screen_device_index() -> str:
+        """Auto-detect the avfoundation index for the first screen capture device."""
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                capture_output=True, text=True, timeout=5,
+            )
+            in_video = False
+            for line in r.stderr.splitlines():
+                if "video devices" in line.lower():
+                    in_video = True
+                elif "audio devices" in line.lower():
+                    break
+                elif in_video and ("screen" in line.lower() or "display" in line.lower()):
+                    m = re.search(r'\[(\d+)\]', line)
+                    if m:
+                        return m.group(1)
+        except Exception:
+            pass
+        return "1"
 
-        video_input = "1"           # screen capture
-        audio_input = "0" if self.mic else "none"
+    def run(self):
+        screen = self._screen_device_index()
+        audio_suffix = ":0" if self.mic else ":"
 
         cmd = [
-            "ffmpeg",
-            "-y",                   # overwrite output
+            "ffmpeg", "-y",
             "-f", "avfoundation",
             "-framerate", "30",
             "-capture_cursor", "1",
-            "-i", f"{video_input}:{audio_input}",
+            "-i", f"{screen}{audio_suffix}",
             "-vcodec", "libx264",
             "-preset", "ultrafast",
             "-crf", "23",
             "-pix_fmt", "yuv420p",
-            self.output_path,
         ]
-
-        # If no audio, drop the audio stream entirely
         if not self.mic:
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-f", "avfoundation",
-                "-framerate", "30",
-                "-capture_cursor", "1",
-                "-i", f"{video_input}:",
-                "-vcodec", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "23",
-                "-pix_fmt", "yuv420p",
-                "-an",              # no audio
-                self.output_path,
-            ]
+            cmd += ["-an"]
+        cmd.append(self.output_path)
 
         try:
-            self._proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self._proc.wait()
-            if not self._stop.is_set():
-                self.finished.emit(self.output_path)
+            with tempfile.TemporaryFile() as errfile:
+                self._proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=errfile,
+                )
+                self._proc.wait()
+                rc = self._proc.returncode
+
+                if os.path.exists(self.output_path) and os.path.getsize(self.output_path) > 0:
+                    self.finished.emit(self.output_path)
+                else:
+                    errfile.seek(0)
+                    msg = errfile.read().decode(errors="replace")
+                    self.error.emit(f"ffmpeg error (code {rc}):\n\n{msg[-800:]}")
         except FileNotFoundError:
-            self.error.emit(
-                "ffmpeg not found.\n\nInstall it with:\n  brew install ffmpeg"
-            )
+            self.error.emit("ffmpeg not found.\n\nInstall it with:\n  brew install ffmpeg")
         except Exception as e:
             self.error.emit(str(e))
 
     def stop(self):
-        """Send 'q' to ffmpeg stdin to stop gracefully."""
         self._stop.set()
         if self._proc and self._proc.poll() is None:
             try:
@@ -380,16 +453,19 @@ class NLRecorder(QMainWindow):
         self.setObjectName("root")
 
         # State
-        self.mic_on      = False
-        self.sys_on      = True
-        self.recording   = False
-        self._worker     = None
-        self._fake_timer = QTimer(self)   # placeholder progress anim
+        self.mic_on           = False
+        self.sys_on           = True
+        self.recording        = False
+        self._worker          = None
+        self._live_preview    = None
+        self._fake_timer      = QTimer(self)
         self._fake_timer.timeout.connect(self._tick_progress)
-        self._progress   = 0.0
+        self._progress        = 0.0
 
         self._build_ui()
         self.setStyleSheet(STYLESHEET)
+        # Start live preview immediately — always-on like OBS
+        QTimer.singleShot(300, self._start_live_preview)
 
     # ── UI construction ──────────────────────────────────────────────────────
 
@@ -482,31 +558,18 @@ class NLRecorder(QMainWindow):
         screen_layout.setContentsMargins(0, 0, 0, 0)
         screen_layout.setSpacing(0)
 
-        # Placeholder
+        # Placeholder shown until first preview frame arrives
         self.placeholder = QLabel("Describe what to record")
         self.placeholder.setObjectName("previewPlaceholder")
         self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         screen_layout.addWidget(self.placeholder, stretch=1)
 
-        # Mock canvas (hidden until recording)
-        self.canvas = QWidget()
-        self.canvas.setObjectName("previewCanvas")
-        self.canvas.hide()
-        canvas_layout = QVBoxLayout(self.canvas)
-        canvas_layout.setContentsMargins(14, 14, 14, 14)
-        canvas_layout.setSpacing(8)
-        for kind in ["short", "long", "med", "accent", "long", "short", "med"]:
-            bar = QFrame()
-            bar.setFixedHeight(8)
-            color = "#2a424a" if kind == "accent" else "#2a2a2a"
-            w_pct = {"short": 35, "med": 60, "long": 82, "accent": 48}[kind]
-            bar.setStyleSheet(
-                f"background:{color}; border-radius:2px;"
-            )
-            bar.setMaximumWidth(int(620 * w_pct / 100))
-            canvas_layout.addWidget(bar)
-        canvas_layout.addStretch()
-        screen_layout.addWidget(self.canvas, stretch=1)
+        # Live preview label (hidden until streaming starts)
+        self.preview_label = QLabel()
+        self.preview_label.setObjectName("previewImage")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.hide()
+        screen_layout.addWidget(self.preview_label, stretch=1)
 
         # Timeline
         self.timeline = TimelineBar()
@@ -531,6 +594,7 @@ class NLRecorder(QMainWindow):
             'Type "record" to start, or describe what to capture...'
         )
         self.nl_input.returnPressed.connect(self._handle_input)
+        self.nl_input.textChanged.connect(self._on_text_changed)
         layout.addWidget(self.nl_input, stretch=1)
 
         # Record button
@@ -591,11 +655,13 @@ class NLRecorder(QMainWindow):
         self.record_btn.style().unpolish(self.record_btn)
         self.record_btn.style().polish(self.record_btn)
 
+        self._stop_live_preview()   # one ffmpeg at a time
         self.placeholder.hide()
-        self.canvas.show()
+        self.preview_label.show()
         self.timeline.reset()
 
         # Build output path
+        #this is where code gets saved
         ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         home = os.path.expanduser("~/Desktop")
         self._output_path = os.path.join(home, f"recording_{ts}.mp4")
@@ -628,16 +694,8 @@ class NLRecorder(QMainWindow):
     def _on_recording_done(self, path: str):
         self._set_status(recording=False, text="Saved ✓")
         self.timeline.set_progress(1.0)
-
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Recording saved")
-        msg.setText(f"Saved to:\n{path}")
-        msg.setStandardButtons(
-            QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Ok
-        )
-        msg.setDefaultButton(QMessageBox.StandardButton.Ok)
-        if msg.exec() == QMessageBox.StandardButton.Open:
-            subprocess.run(["open", "-R", path])  # reveal in Finder
+        subprocess.run(["open", "-R", path])
+        self._maybe_restart_preview()
 
     def _on_recording_error(self, msg: str):
         self.recording = False
@@ -647,7 +705,7 @@ class NLRecorder(QMainWindow):
         self.record_btn.setProperty("recording", "false")
         self.record_btn.style().unpolish(self.record_btn)
         self.record_btn.style().polish(self.record_btn)
-
+        self._maybe_restart_preview()
         QMessageBox.critical(self, "Recording error", msg)
 
     def _toggle_mic(self):
@@ -672,11 +730,46 @@ class NLRecorder(QMainWindow):
         self.status_dot.set_recording(recording)
         self.status_label.setText(text)
 
+    # ── Live preview ─────────────────────────────────────────────────────────
+
+    def _on_text_changed(self, *_):
+        pass  # preview is always-on; text drives NL matching only
+
+    def _start_live_preview(self):
+        if self._live_preview and self._live_preview.isRunning():
+            return
+        idx = RecordWorker._screen_device_index()
+        self._live_preview = LivePreviewThread(idx)
+        self._live_preview.frame_ready.connect(self._on_preview_frame)
+        self._live_preview.start()
+
+    def _stop_live_preview(self):
+        if self._live_preview:
+            self._live_preview.stop()
+            self._live_preview.quit()
+            self._live_preview.wait(2000)
+            self._live_preview = None
+
+    def _on_preview_frame(self, pixmap: QPixmap):
+        self.placeholder.hide()
+        scaled = pixmap.scaled(
+            self.preview_label.width(),
+            self.preview_label.height(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        self.preview_label.setPixmap(scaled)
+        self.preview_label.show()
+
+    def _maybe_restart_preview(self):
+        self._start_live_preview()
+
     # ── Cleanup on close ─────────────────────────────────────────────────────
 
     def closeEvent(self, event):
         if self.recording:
             self._stop_recording()
+        self._stop_live_preview()
         event.accept()
 
 
