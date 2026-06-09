@@ -8,10 +8,13 @@ Deps: pip install pyqt6   (ffmpeg must be installed: brew install ffmpeg)
 import sys
 import os
 import re
+import json
 import subprocess
 import datetime
 import tempfile
 import threading
+import urllib.request
+import urllib.error
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -43,6 +46,9 @@ TEXT_MUTED   = "#444444"
 
 ACCENT_BLUE  = "#4a9eff"
 ACCENT_RED   = "#ff3b30"
+
+OLLAMA_URL   = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.2"
 
 
 # ─── Stylesheet ─────────────────────────────────────────────────────────────
@@ -205,6 +211,14 @@ QPushButton#sysBtn[active="true"] {{
     background: #0d1a2a;
     border: 1px solid #1e3050;
     color: {ACCENT_BLUE};
+}}
+
+/* Match label */
+QLabel#matchLabel {{
+    color: {ACCENT_BLUE};
+    font-size: 11px;
+    padding: 0 6px;
+    max-width: 160px;
 }}
 
 /* Scrollbar */
@@ -392,6 +406,86 @@ class WindowScanner(QThread):
                 self.msleep(100)
 
 
+# ─── Ollama NL matcher ───────────────────────────────────────────────────────
+
+class OllamaMatchThread(QThread):
+    """Ask Ollama to name the best matching app/tab, then resolve that name to an index.
+
+    Asking for a name is far more reliable than asking for an index —
+    small models (3B) are poor at counting list positions but good at naming things.
+    """
+    matched = pyqtSignal(int)   # resolved window index, or -1
+
+    def __init__(self, query: str, windows: list):
+        super().__init__()
+        self._query   = query
+        self._windows = windows
+
+    def _resolve(self, response: str) -> int:
+        """Word-boundary match the model's text response against the window list."""
+        resp = response.lower().strip().strip('"\'')
+        if not resp:
+            return -1
+        words = [wd for wd in re.findall(r'\w+', resp) if len(wd) > 2]
+        best_idx, best_score = -1, 0
+        for i, w in enumerate(self._windows):
+            app_orig = w['app'].lower()
+            app_norm = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', w['app']).lower()
+            haystack = f"{app_orig} {app_norm} {w.get('title', '')}".lower()
+            score    = sum(
+                1 for wd in words
+                if re.search(r'\b' + re.escape(wd) + r'\b', haystack)
+            )
+            if score > best_score:
+                best_score, best_idx = score, i
+        return best_idx if best_score > 0 else -1
+
+    def run(self):
+        if not self._windows or self.isInterruptionRequested():
+            self.matched.emit(-1)
+            return
+
+        # Build a human-readable option list (no indices — we don't want the model to count)
+        seen, options = set(), []
+        for w in self._windows:
+            if w.get('is_tab') and w.get('title'):
+                label = f"{w['app']} tab: {w['title']}"
+            elif w.get('title'):
+                label = f"{w['app']}: {w['title']}"
+            else:
+                label = w['app']
+            if label not in seen:
+                seen.add(label)
+                options.append(label)
+
+        options_str = "\n".join(f"- {o}" for o in options)
+        prompt = (
+            f"Open apps and tabs:\n{options_str}\n\n"
+            f'User wants to record: "{self._query}"\n\n'
+            "Reply with only the name of the app or tab title from the list above "
+            "that best matches what the user wants to record. Copy it exactly. Nothing else."
+        )
+        payload = json.dumps({
+            "model":  OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+        }).encode()
+
+        try:
+            req = urllib.request.Request(
+                OLLAMA_URL,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+                text = data.get("response", "").strip()
+                self.matched.emit(self._resolve(text))
+        except Exception:
+            self.matched.emit(-1)
+
+
 # ─── Live preview worker ─────────────────────────────────────────────────────
 
 class LivePreviewThread(QThread):
@@ -565,6 +659,11 @@ class NLRecorder(QMainWindow):
         self._live_preview    = None
         self._windows         = []      # current scanned window list
         self._target_idx      = None    # index of NL-matched window
+        self._ollama_thread   = None
+        self._ollama_timer    = QTimer(self)
+        self._ollama_timer.setSingleShot(True)
+        self._ollama_timer.setInterval(600)
+        self._ollama_timer.timeout.connect(self._ask_ollama)
         self._fake_timer      = QTimer(self)
         self._fake_timer.timeout.connect(self._tick_progress)
         self._progress        = 0.0
@@ -701,6 +800,12 @@ class NLRecorder(QMainWindow):
         self.nl_input.textChanged.connect(self._on_text_changed)
         layout.addWidget(self.nl_input, stretch=1)
 
+        # Ollama match label
+        self.match_label = QLabel()
+        self.match_label.setObjectName("matchLabel")
+        self.match_label.hide()
+        layout.addWidget(self.match_label)
+
         # Record button
         self.record_btn = QPushButton("● Record")
         self.record_btn.setObjectName("recordBtn")
@@ -749,6 +854,7 @@ class NLRecorder(QMainWindow):
             self._start_recording()
 
     def _start_recording(self):
+        self._activate_target()   # bring matched window to front first
         self.recording = True
         self._progress = 0.0
 
@@ -850,29 +956,123 @@ class NLRecorder(QMainWindow):
         if self.nl_input.text().strip():
             self._highlight_match(self.nl_input.text())
 
+    _STOP_WORDS = {
+        "record", "start", "stop", "capture", "show", "open", "play", "stream",
+        "the", "a", "an", "in", "on", "and", "my", "me", "that", "this", "for",
+        "with", "about", "from", "to", "of", "at", "by",
+    }
+
     def _highlight_match(self, text: str):
-        words = [w for w in text.lower().split() if len(w) > 2]
+        words = [w for w in text.lower().split()
+                 if len(w) > 2 and w not in self._STOP_WORDS]
+        if not words:
+            return
         best_idx, best_score = None, 0
         for i, w in enumerate(self._windows):
-            haystack = f"{w['app']} {w['title']}".lower()
-            score = sum(1 for word in words if word in haystack)
+            app_orig = w['app'].lower()
+            # Also split camelCase: "OneNote"→"one note", "YouTube"→"you tube"
+            app_norm = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', w['app']).lower()
+            # Keep both so "onenote" matches the original AND "one"/"note" match the split
+            haystack = f"{app_orig} {app_norm} {w['title']}".lower()
+            score = sum(
+                1 for word in words
+                if re.search(r'\b' + re.escape(word) + r'\b', haystack)
+            )
             if score > best_score:
                 best_score, best_idx = score, i
-        if best_idx is not None:
+        if best_idx is not None and best_score > 0:
             self.window_list.setCurrentRow(best_idx)
             self._target_idx = best_idx
         else:
             self.window_list.clearSelection()
             self._target_idx = None
 
+    def _ask_ollama(self):
+        text = self.nl_input.text().strip()
+        if not text or not self._windows:
+            return
+        if self._ollama_thread and self._ollama_thread.isRunning():
+            self._ollama_thread.requestInterruption()
+        self._ollama_thread = OllamaMatchThread(text, list(self._windows))
+        self._ollama_thread.matched.connect(self._on_ollama_matched)
+        self._ollama_thread.start()
+        self.match_label.setText("Matching…")
+        self.match_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+        self.match_label.show()
+
+    def _on_ollama_matched(self, idx: int):
+        if not self.nl_input.text().strip():
+            self.match_label.hide()
+            return
+        if idx == -1 or idx >= len(self._windows):
+            # Ollama failed — keep the keyword match result if one exists
+            if self._target_idx is not None and self._target_idx < len(self._windows):
+                w       = self._windows[self._target_idx]
+                title   = w.get('title') or w['app']
+                display = (title[:28] + '…') if len(title) > 28 else title
+                self.match_label.setText(f"→ {display}")
+                self.match_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+                self.match_label.show()
+            else:
+                self.match_label.hide()
+            return
+        w = self._windows[idx]
+        self._target_idx = idx
+        self.window_list.setCurrentRow(idx)
+        title   = w.get('title') or w['app']
+        display = (title[:28] + '…') if len(title) > 28 else title
+        self.match_label.setText(f"→ {display}")
+        self.match_label.setStyleSheet(f"color: {ACCENT_BLUE}; font-size: 11px;")
+        self.match_label.show()
+
+    def _activate_target(self):
+        """Bring the matched window/tab to the front before recording starts."""
+        if self._target_idx is None or self._target_idx >= len(self._windows):
+            return
+        w      = self._windows[self._target_idx]
+        app    = w.get('app', '')
+        title  = w.get('title', '')
+        is_tab = w.get('is_tab', False)
+
+        if is_tab and app in BROWSER_APPS:
+            safe = title.replace('\\', '\\\\').replace('"', '\\"')
+            script = f"""
+tell application "Google Chrome"
+    repeat with win in windows
+        set tidx to 1
+        repeat with t in tabs of win
+            if title of t is "{safe}" then
+                set active tab index of win to tidx
+                tell win to set index to 1
+                activate
+                return
+            end if
+            set tidx to tidx + 1
+        end repeat
+    end repeat
+end tell
+"""
+        elif app:
+            script = f'tell application "{app}" to activate'
+        else:
+            return
+
+        try:
+            subprocess.run(["osascript", "-e", script], timeout=5, capture_output=True)
+        except Exception:
+            pass
+
     # ── Live preview ─────────────────────────────────────────────────────────
 
     def _on_text_changed(self, text: str):
+        self._ollama_timer.stop()
         if text.strip() and self._windows:
-            self._highlight_match(text)
+            self._highlight_match(text)      # instant keyword match
+            self._ollama_timer.start()       # Ollama fires 600 ms after last keystroke
         else:
             self.window_list.clearSelection()
             self._target_idx = None
+            self.match_label.hide()
 
     def _start_live_preview(self):
         if self._live_preview and self._live_preview.isRunning():
@@ -909,6 +1109,10 @@ class NLRecorder(QMainWindow):
         if self.recording:
             self._stop_recording()
         self._stop_live_preview()
+        self._ollama_timer.stop()
+        if self._ollama_thread and self._ollama_thread.isRunning():
+            self._ollama_thread.requestInterruption()
+            self._ollama_thread.wait(2000)
         self._scanner.requestInterruption()
         self._scanner.wait(2000)
         event.accept()
