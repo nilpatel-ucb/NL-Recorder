@@ -75,3 +75,6 @@ ffmpeg -f avfoundation -list_devices true -i ""
 | Real window targeting | `selectWindow()` + pass window ID to ffmpeg `-filter_complex` |
 | Change output folder | `_output_path` in `_start_recording()` |
 | Change video quality | `-crf` value in `RecordWorker.run()` (lower = better quality) |
+
+## PRD Doc
+[text](https://docs.google.com/document/d/1Le3FkAkFeJKZodiW1iQQW61X2FX9IlpJ/edit)
