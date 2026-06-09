@@ -287,8 +287,113 @@ class TimelineBar(QWidget):
             p.fillRect(0, 0, w, self.height(), QColor(ACCENT_BLUE))
 
 
+# ─── Window scanning ─────────────────────────────────────────────────────────
+
+BROWSER_APPS = {"Google Chrome", "Chrome", "Chromium", "Microsoft Edge", "Safari"}
+_SKIP_APPS   = {"NL Recorder", "Dock", "Menu Bar", "Window Server", "SystemUIServer",
+                "NotificationCenter", "Control Center", "Spotlight"}
+
+
+def _scan_windows() -> list:
+    """Return list of {'app', 'title'} for visible user-facing windows."""
+    try:
+        import Quartz
+        wl = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly |
+            Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID,
+        )
+        seen, result = set(), []
+        for w in wl:
+            if w.get("kCGWindowLayer", 1) != 0:
+                continue
+            app   = (w.get("kCGWindowOwnerName") or "").strip()
+            title = (w.get("kCGWindowName")      or "").strip()
+            if not app or app in _SKIP_APPS:
+                continue
+            key = (app, title)
+            if key not in seen:
+                seen.add(key)
+                result.append({"app": app, "title": title})
+        return result
+    except ImportError:
+        pass
+
+    # Fallback: list regular foreground apps via osascript
+    try:
+        script = (
+            'tell application "System Events" to '
+            'get name of every process whose background only is false'
+        )
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            apps = [a.strip() for a in r.stdout.strip().split(", ")
+                    if a.strip() and a.strip() not in _SKIP_APPS]
+            return [{"app": a, "title": ""} for a in apps]
+    except Exception:
+        pass
+    return []
+
+
+def _get_chrome_tabs() -> list:
+    """Return all Chrome tab titles across all windows."""
+    if subprocess.run(["pgrep", "-x", "Google Chrome"], capture_output=True).returncode != 0:
+        return []
+    script = """
+tell application "Google Chrome"
+    set out to ""
+    repeat with w in windows
+        repeat with t in tabs of w
+            if out is not "" then set out to out & "|||"
+            set out to out & title of t
+        end repeat
+    end repeat
+    return out
+end tell
+"""
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return [t.strip() for t in r.stdout.strip().split("|||") if t.strip()]
+    except Exception:
+        pass
+    return []
+
+
+class WindowScanner(QThread):
+    """Scans for open windows every 3 s and emits the list."""
+    updated = pyqtSignal(list)   # list[dict]  {'app', 'title', 'is_tab'}
+
+    def run(self):
+        while not self.isInterruptionRequested():
+            wins = _scan_windows()
+
+            # Replace Chrome Quartz entries with individual tabs from AppleScript
+            chrome_tabs_injected = False
+            result = []
+            for w in wins:
+                if w["app"] in BROWSER_APPS:
+                    if not chrome_tabs_injected:
+                        chrome_tabs_injected = True
+                        tabs = _get_chrome_tabs()
+                        if tabs:
+                            for tab in tabs:
+                                result.append({"app": w["app"], "title": tab, "is_tab": True})
+                        else:
+                            result.append({**w, "is_tab": False})
+                else:
+                    result.append({**w, "is_tab": False})
+
+            self.updated.emit(result)
+
+            for _ in range(30):          # 3 s total, interruptible every 100 ms
+                if self.isInterruptionRequested():
+                    return
+                self.msleep(100)
+
+
 # ─── Live preview worker ─────────────────────────────────────────────────────
-#the segment which allows the preview video to get a live feed
+
 class LivePreviewThread(QThread):
     """Streams screen frames via ffmpeg mjpeg pipe at ~15 fps.
 
@@ -458,14 +563,20 @@ class NLRecorder(QMainWindow):
         self.recording        = False
         self._worker          = None
         self._live_preview    = None
+        self._windows         = []      # current scanned window list
+        self._target_idx      = None    # index of NL-matched window
         self._fake_timer      = QTimer(self)
         self._fake_timer.timeout.connect(self._tick_progress)
         self._progress        = 0.0
 
         self._build_ui()
         self.setStyleSheet(STYLESHEET)
-        # Start live preview immediately — always-on like OBS
+
+        # Start live preview and window scanner
         QTimer.singleShot(300, self._start_live_preview)
+        self._scanner = WindowScanner()
+        self._scanner.updated.connect(self._on_windows_updated)
+        self._scanner.start()
 
     # ── UI construction ──────────────────────────────────────────────────────
 
@@ -507,18 +618,11 @@ class NLRecorder(QMainWindow):
         self.window_list.setObjectName("windowList")
         self.window_list.setSpacing(0)
 
-        windows = [
-            ("Safari",   "Active"),
-            ("VS Code",  "Background"),
-            ("Terminal", "Background"),
-            ("Finder",   "Background"),
-        ]
-        for name, sub in windows:
-            item = QListWidgetItem(f"{name}\n{sub}")
-            item.setSizeHint(QSize(200, 50))
-            self.window_list.addItem(item)
+        # Populated dynamically by WindowScanner
+        scanning_item = QListWidgetItem("Scanning…")
+        scanning_item.setForeground(QColor(TEXT_MUTED))
+        self.window_list.addItem(scanning_item)
 
-        self.window_list.setCurrentRow(0)
         layout.addWidget(self.window_list, stretch=1)
         return sidebar
 
@@ -730,10 +834,45 @@ class NLRecorder(QMainWindow):
         self.status_dot.set_recording(recording)
         self.status_label.setText(text)
 
+    # ── Window list ──────────────────────────────────────────────────────────
+
+    def _on_windows_updated(self, windows: list):
+        self._windows = windows
+        self.window_list.clear()
+        for w in windows:
+            label  = w["app"]
+            detail = w["title"]
+            text   = f"{label}\n  {detail[:48]}" if detail else label
+            item   = QListWidgetItem(text)
+            item.setSizeHint(QSize(200, 52))
+            self.window_list.addItem(item)
+        # Re-highlight if user already typed something
+        if self.nl_input.text().strip():
+            self._highlight_match(self.nl_input.text())
+
+    def _highlight_match(self, text: str):
+        words = [w for w in text.lower().split() if len(w) > 2]
+        best_idx, best_score = None, 0
+        for i, w in enumerate(self._windows):
+            haystack = f"{w['app']} {w['title']}".lower()
+            score = sum(1 for word in words if word in haystack)
+            if score > best_score:
+                best_score, best_idx = score, i
+        if best_idx is not None:
+            self.window_list.setCurrentRow(best_idx)
+            self._target_idx = best_idx
+        else:
+            self.window_list.clearSelection()
+            self._target_idx = None
+
     # ── Live preview ─────────────────────────────────────────────────────────
 
-    def _on_text_changed(self, *_):
-        pass  # preview is always-on; text drives NL matching only
+    def _on_text_changed(self, text: str):
+        if text.strip() and self._windows:
+            self._highlight_match(text)
+        else:
+            self.window_list.clearSelection()
+            self._target_idx = None
 
     def _start_live_preview(self):
         if self._live_preview and self._live_preview.isRunning():
@@ -770,6 +909,8 @@ class NLRecorder(QMainWindow):
         if self.recording:
             self._stop_recording()
         self._stop_live_preview()
+        self._scanner.requestInterruption()
+        self._scanner.wait(2000)
         event.accept()
 
 
