@@ -23,6 +23,7 @@ struct ContentView: View {
         }
         .frame(width: 860, height: 520)
         .onAppear {
+            ScreenCapturePermission.requestIfNeeded()
             windowEnumerator.refresh()
         }
         .onReceive(

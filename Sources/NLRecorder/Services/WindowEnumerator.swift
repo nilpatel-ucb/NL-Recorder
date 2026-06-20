@@ -2,28 +2,44 @@ import AppKit
 import Combine
 import CoreGraphics
 import Foundation
+import ScreenCaptureKit
 
 @MainActor
 final class WindowEnumerator: ObservableObject {
     @Published private(set) var windows: [WindowInfo] = []
     @Published var selectedWindowID: CGWindowID?
+    @Published private(set) var needsScreenRecordingPermission = false
 
     private let ownPID = ProcessInfo.processInfo.processIdentifier
 
     func refresh() {
-        guard let rawList = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements],
-            kCGNullWindowID
-        ) as? [[String: Any]] else {
-            windows = []
-            return
+        Task {
+            await refreshAsync()
         }
+    }
 
+    func select(_ window: WindowInfo) {
+        selectedWindowID = window.id
+    }
+
+    private func refreshAsync() async {
         var results: [WindowInfo] = []
 
-        for info in rawList {
-            guard let window = parseWindow(from: info) else { continue }
-            results.append(window)
+        if ScreenCapturePermission.hasScreenRecordingAccess() {
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(
+                    false,
+                    onScreenWindowsOnly: true
+                )
+                for window in content.windows {
+                    guard let info = parseSCWindow(window) else { continue }
+                    results.append(info)
+                }
+            } catch {
+                results = fetchFromCGWindowList()
+            }
+        } else {
+            results = fetchFromCGWindowList()
         }
 
         results.sort {
@@ -34,6 +50,8 @@ final class WindowEnumerator: ObservableObject {
         }
 
         windows = results
+        needsScreenRecordingPermission = !ScreenCapturePermission.hasScreenRecordingAccess()
+            || (!results.isEmpty && results.allSatisfy { $0.windowTitle.isEmpty })
 
         if let selected = selectedWindowID,
            !windows.contains(where: { $0.id == selected }) {
@@ -41,8 +59,31 @@ final class WindowEnumerator: ObservableObject {
         }
     }
 
-    func select(_ window: WindowInfo) {
-        selectedWindowID = window.id
+    private func fetchFromCGWindowList() -> [WindowInfo] {
+        guard let rawList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return []
+        }
+
+        return rawList.compactMap { parseWindow(from: $0) }
+    }
+
+    private func parseSCWindow(_ window: SCWindow) -> WindowInfo? {
+        let bounds = window.frame
+        guard bounds.width >= 100, bounds.height >= 100 else { return nil }
+
+        let ownerPID = window.owningApplication?.processID ?? 0
+        if ownerPID == ownPID { return nil }
+
+        return WindowInfo(
+            id: window.windowID,
+            appName: window.owningApplication?.applicationName ?? "Unknown",
+            windowTitle: window.title ?? "",
+            bounds: bounds,
+            ownerPID: ownerPID
+        )
     }
 
     private func parseWindow(from info: [String: Any]) -> WindowInfo? {

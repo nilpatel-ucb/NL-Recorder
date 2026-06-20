@@ -12,6 +12,10 @@ struct WindowSidebarView: View {
 
             Divider()
 
+            if enumerator.needsScreenRecordingPermission {
+                permissionBanner
+            }
+
             if enumerator.windows.isEmpty {
                 emptyState
             } else {
@@ -36,6 +40,25 @@ struct WindowSidebarView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private var permissionBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(
+                "Screen Recording permission required to see window titles",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.orange)
+
+            Button("Open System Settings") {
+                ScreenCapturePermission.openScreenRecordingSettings()
+            }
+            .controlSize(.small)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12))
     }
 
     private var emptyState: some View {
