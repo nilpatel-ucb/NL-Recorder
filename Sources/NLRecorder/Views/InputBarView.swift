@@ -2,6 +2,7 @@ import SwiftUI
 
 struct InputBarView: View {
     @Binding var prompt: String
+    var isPreviewActive: Bool = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -21,6 +22,7 @@ struct InputBarView: View {
             .buttonStyle(.borderedProminent)
             .tint(.blue)
             .keyboardShortcut(.return, modifiers: [.command])
+            .disabled(!isPreviewActive)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
