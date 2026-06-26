@@ -7,7 +7,8 @@ import ScreenCaptureKit
 @MainActor
 final class WindowEnumerator: ObservableObject {
     @Published private(set) var windows: [WindowInfo] = []
-    @Published var selectedWindowID: CGWindowID?
+    @Published private(set) var displays: [DisplayInfo] = []
+    @Published var selection: CaptureSelection?
     @Published private(set) var needsScreenRecordingPermission = false
 
     private let ownPID = ProcessInfo.processInfo.processIdentifier
@@ -19,11 +20,16 @@ final class WindowEnumerator: ObservableObject {
     }
 
     func select(_ window: WindowInfo) {
-        selectedWindowID = window.id
+        selection = .window(window.id)
+    }
+
+    func select(_ display: DisplayInfo) {
+        selection = .display(display.id)
     }
 
     private func refreshAsync() async {
         var results: [WindowInfo] = []
+        var displayResults: [DisplayInfo] = []
 
         if ScreenCapturePermission.hasScreenRecordingAccess() {
             do {
@@ -34,6 +40,11 @@ final class WindowEnumerator: ObservableObject {
                 for window in content.windows {
                     guard let info = parseSCWindow(window) else { continue }
                     results.append(info)
+                }
+
+                let mainDisplayID = CGMainDisplayID()
+                displayResults = content.displays.map {
+                    DisplayInfo.from(scDisplay: $0, mainDisplayID: mainDisplayID)
                 }
             } catch {
                 results = fetchFromCGWindowList()
@@ -49,13 +60,25 @@ final class WindowEnumerator: ObservableObject {
             return $0.windowTitle.localizedCaseInsensitiveCompare($1.windowTitle) == .orderedAscending
         }
 
+        displayResults.sort {
+            if $0.isMain != $1.isMain {
+                return $0.isMain
+            }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+
         windows = results
+        displays = displayResults
         needsScreenRecordingPermission = !ScreenCapturePermission.hasScreenRecordingAccess()
             || (!results.isEmpty && results.allSatisfy { $0.windowTitle.isEmpty })
 
-        if let selected = selectedWindowID,
-           !windows.contains(where: { $0.id == selected }) {
-            selectedWindowID = nil
+        switch selection {
+        case .window(let id) where !windows.contains(where: { $0.id == id }):
+            selection = nil
+        case .display(let id) where !displays.contains(where: { $0.id == id }):
+            selection = nil
+        default:
+            break
         }
     }
 

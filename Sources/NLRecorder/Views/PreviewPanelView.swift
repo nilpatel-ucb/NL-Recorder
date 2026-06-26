@@ -3,6 +3,7 @@ import SwiftUI
 struct PreviewPanelView: View {
     @ObservedObject var previewController: WindowPreviewController
     let selectedWindow: WindowInfo?
+    let selectedDisplay: DisplayInfo?
 
     private var statusColor: Color {
         if previewController.isRecording {
@@ -22,6 +23,16 @@ struct PreviewPanelView: View {
             return "Previewing"
         }
         return "Ready"
+    }
+
+    private var selectionCaption: String? {
+        if let selectedWindow {
+            return "\(selectedWindow.appName) — \(selectedWindow.truncatedTitle)"
+        }
+        if let selectedDisplay {
+            return selectedDisplay.name
+        }
+        return nil
     }
 
     var body: some View {
@@ -73,12 +84,12 @@ struct PreviewPanelView: View {
             Image(systemName: "macwindow.on.rectangle")
                 .font(.system(size: 36))
                 .foregroundStyle(.secondary)
-            Text("Select a window to preview")
+            Text("Select a window or display to preview")
                 .font(.title3)
                 .foregroundStyle(.secondary)
 
-            if let selectedWindow {
-                Text("Selected: \(selectedWindow.appName) — \(selectedWindow.truncatedTitle)")
+            if let selectionCaption {
+                Text("Selected: \(selectionCaption)")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
                     .multilineTextAlignment(.center)
@@ -99,8 +110,8 @@ struct PreviewPanelView: View {
                         .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
                 }
 
-            if let selectedWindow {
-                Text("\(selectedWindow.appName) — \(selectedWindow.truncatedTitle)")
+            if let selectionCaption {
+                Text(selectionCaption)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)

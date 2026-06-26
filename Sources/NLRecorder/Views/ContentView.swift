@@ -15,7 +15,8 @@ struct ContentView: View {
 
                 PreviewPanelView(
                     previewController: previewController,
-                    selectedWindow: selectedWindow
+                    selectedWindow: selectedWindow,
+                    selectedDisplay: selectedDisplay
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -37,13 +38,21 @@ struct ContentView: View {
         .onAppear {
             ScreenCapturePermission.requestIfNeeded()
             windowEnumerator.refresh()
-            previewController.updateSelectedWindow(selectedWindow)
+            previewController.updateSelection(
+                windowEnumerator.selection,
+                window: selectedWindow,
+                display: selectedDisplay
+            )
         }
         .onDisappear {
             previewController.shutdown()
         }
-        .onChange(of: windowEnumerator.selectedWindowID) { _ in
-            previewController.updateSelectedWindow(selectedWindow)
+        .onChange(of: windowEnumerator.selection) { _ in
+            previewController.updateSelection(
+                windowEnumerator.selection,
+                window: selectedWindow,
+                display: selectedDisplay
+            )
         }
         .onReceive(
             NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
@@ -53,7 +62,12 @@ struct ContentView: View {
     }
 
     private var selectedWindow: WindowInfo? {
-        guard let id = windowEnumerator.selectedWindowID else { return nil }
+        guard case .window(let id) = windowEnumerator.selection else { return nil }
         return windowEnumerator.windows.first { $0.id == id }
+    }
+
+    private var selectedDisplay: DisplayInfo? {
+        guard case .display(let id) = windowEnumerator.selection else { return nil }
+        return windowEnumerator.displays.first { $0.id == id }
     }
 }

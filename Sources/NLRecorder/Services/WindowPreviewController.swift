@@ -14,10 +14,12 @@ final class WindowPreviewController: ObservableObject {
 
     private var stream: SCStream?
     private var streamOutput: StreamOutputHandler?
-    private var selectedWindow: WindowInfo?
+    private var activeSelection: CaptureSelection?
     private var streamWidth = 0
     private var streamHeight = 0
     private var cancellables = Set<AnyCancellable>()
+
+    private let ownPID = ProcessInfo.processInfo.processIdentifier
 
     init() {
         recordingController.objectWillChange
@@ -36,19 +38,30 @@ final class WindowPreviewController: ObservableObject {
         recordingController.recordingDuration
     }
 
-    func updateSelectedWindow(_ window: WindowInfo?) {
-        guard window?.id != selectedWindow?.id else { return }
+    func updateSelection(_ selection: CaptureSelection?, window: WindowInfo?, display: DisplayInfo?) {
+        guard selection != activeSelection else { return }
 
         Task {
             if recordingController.isRecording {
                 await stopRecording()
             }
 
-            selectedWindow = window
+            activeSelection = selection
 
-            if let window {
-                await restartPreview(for: window)
-            } else {
+            switch selection {
+            case .window(let id):
+                if let window, window.id == id {
+                    await restartPreview(for: window)
+                } else {
+                    await stopPreview()
+                }
+            case .display(let id):
+                if let display, display.id == id {
+                    await restartPreview(for: display)
+                } else {
+                    await stopPreview()
+                }
+            case nil:
                 await stopPreview()
             }
         }
@@ -60,11 +73,10 @@ final class WindowPreviewController: ObservableObject {
                 await stopRecording()
             }
             await stopPreview()
-            selectedWindow = nil
+            activeSelection = nil
         }
     }
 
-//runs when user clicks record button
     func startRecording() {
         guard isPreviewActive, streamWidth > 0, streamHeight > 0 else { return }
         recordingController.startRecording(width: streamWidth, height: streamHeight)
@@ -104,31 +116,65 @@ final class WindowPreviewController: ObservableObject {
             }
 
             let filter = SCContentFilter(desktopIndependentWindow: scWindow)
-            let configuration = makeStreamConfiguration(for: filter, scWindow: scWindow)
-            streamWidth = configuration.width
-            streamHeight = configuration.height
-//handles the output of the stream, image and sample buffer used both by preview and recording
-            let handler = StreamOutputHandler(
-                onFrame: { [weak self] image in
-                    self?.previewImage = image
-                },
-                onSampleBuffer: { [weak self] sampleBuffer in
-                    self?.recordingController.append(sampleBuffer)
-                }
+            let configuration = makeStreamConfiguration(
+                for: filter,
+                fallbackBounds: scWindow.frame
             )
-            streamOutput = handler
-
-            let newStream = SCStream(filter: filter, configuration: configuration, delegate: nil)
-            try newStream.addStreamOutput(handler, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
-            try await newStream.startCapture()
-
-            stream = newStream
-            isPreviewActive = true
+            try await startStream(filter: filter, configuration: configuration)
         } catch {
-            errorMessage = humanReadableError(error)
-            isPreviewActive = false
-            previewImage = nil
+            handlePreviewError(error)
         }
+    }
+
+    private func restartPreview(for display: DisplayInfo) async {
+        await stopPreview()
+        errorMessage = nil
+
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(
+                false,
+                onScreenWindowsOnly: true
+            )
+
+            guard let scDisplay = content.displays.first(where: { $0.displayID == display.id }) else {
+                errorMessage = "The selected display is no longer available."
+                return
+            }
+
+            let ownWindows = content.windows.filter {
+                $0.owningApplication?.processID == ownPID
+            }
+            let filter = SCContentFilter(display: scDisplay, excludingWindows: ownWindows)
+            let configuration = makeStreamConfiguration(
+                for: filter,
+                fallbackBounds: display.bounds
+            )
+            try await startStream(filter: filter, configuration: configuration)
+        } catch {
+            handlePreviewError(error)
+        }
+    }
+
+    private func startStream(filter: SCContentFilter, configuration: SCStreamConfiguration) async throws {
+        streamWidth = configuration.width
+        streamHeight = configuration.height
+
+        let handler = StreamOutputHandler(
+            onFrame: { [weak self] image in
+                self?.previewImage = image
+            },
+            onSampleBuffer: { [weak self] sampleBuffer in
+                self?.recordingController.append(sampleBuffer)
+            }
+        )
+        streamOutput = handler
+
+        let newStream = SCStream(filter: filter, configuration: configuration, delegate: nil)
+        try newStream.addStreamOutput(handler, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
+        try await newStream.startCapture()
+
+        stream = newStream
+        isPreviewActive = true
     }
 
     private func stopPreview() async {
@@ -147,7 +193,7 @@ final class WindowPreviewController: ObservableObject {
         streamHeight = 0
     }
 
-    private func makeStreamConfiguration(for filter: SCContentFilter, scWindow: SCWindow) -> SCStreamConfiguration {
+    private func makeStreamConfiguration(for filter: SCContentFilter, fallbackBounds: CGRect) -> SCStreamConfiguration {
         let configuration = SCStreamConfiguration()
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
         configuration.showsCursor = true
@@ -158,7 +204,7 @@ final class WindowPreviewController: ObservableObject {
             configuration.captureResolution = .best
         }
 
-        let (nativeW, nativeH) = maxCapturePixelSize(filter: filter, scWindow: scWindow)
+        let (nativeW, nativeH) = maxCapturePixelSize(filter: filter, fallbackBounds: fallbackBounds)
         let width = Int(nativeW)
         let height = Int(nativeH)
         configuration.width = width - (width % 2)
@@ -167,16 +213,15 @@ final class WindowPreviewController: ObservableObject {
         return configuration
     }
 
-    private func maxCapturePixelSize(filter: SCContentFilter, scWindow: SCWindow) -> (CGFloat, CGFloat) {
+    private func maxCapturePixelSize(filter: SCContentFilter, fallbackBounds: CGRect) -> (CGFloat, CGFloat) {
         if #available(macOS 14.0, *) {
             let width = CGFloat(filter.contentRect.width) * CGFloat(filter.pointPixelScale)
             let height = CGFloat(filter.contentRect.height) * CGFloat(filter.pointPixelScale)
             return (width, height)
         }
 
-        let frame = scWindow.frame
-        let scale = backingScaleFactor(for: frame)
-        return (frame.width * scale, frame.height * scale)
+        let scale = backingScaleFactor(for: fallbackBounds)
+        return (fallbackBounds.width * scale, fallbackBounds.height * scale)
     }
 
     private func backingScaleFactor(for frame: CGRect) -> CGFloat {
@@ -185,6 +230,12 @@ final class WindowPreviewController: ObservableObject {
             return screen.backingScaleFactor
         }
         return NSScreen.main?.backingScaleFactor ?? 2.0
+    }
+
+    private func handlePreviewError(_ error: Error) {
+        errorMessage = humanReadableError(error)
+        isPreviewActive = false
+        previewImage = nil
     }
 
     private func humanReadableError(_ error: Error) -> String {
