@@ -165,12 +165,16 @@ final class WindowPreviewController: ObservableObject {
             },
             onSampleBuffer: { [weak self] sampleBuffer in
                 self?.recordingController.append(sampleBuffer)
+            },
+            onAudioSampleBuffer: { [weak self] sampleBuffer in
+                self?.recordingController.appendAudio(sampleBuffer)
             }
         )
         streamOutput = handler
 
         let newStream = SCStream(filter: filter, configuration: configuration, delegate: nil)
         try newStream.addStreamOutput(handler, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
+        try newStream.addStreamOutput(handler, type: .audio, sampleHandlerQueue: .global(qos: .userInitiated))
         try await newStream.startCapture()
 
         stream = newStream
@@ -199,6 +203,10 @@ final class WindowPreviewController: ObservableObject {
         configuration.showsCursor = true
         configuration.scalesToFit = false
         configuration.queueDepth = 6
+        configuration.capturesAudio = true
+        configuration.excludesCurrentProcessAudio = true
+        configuration.sampleRate = 48_000
+        configuration.channelCount = 2
 
         if #available(macOS 14.0, *) {
             configuration.captureResolution = .best
@@ -241,7 +249,7 @@ final class WindowPreviewController: ObservableObject {
     private func humanReadableError(_ error: Error) -> String {
         let nsError = error as NSError
         if nsError.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain", nsError.code == -3801 {
-            return "Screen Recording permission is required. Enable NL Recorder in System Settings, "
+            return "Screen & System Audio Recording permission is required. Enable NL Recorder in System Settings, "
                 + "toggle it off and on if you recently rebuilt the app, then quit (⌘Q) and reopen."
         }
         return error.localizedDescription

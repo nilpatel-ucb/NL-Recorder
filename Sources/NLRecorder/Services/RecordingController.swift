@@ -6,6 +6,7 @@ import Foundation
 enum RecordingError: LocalizedError {
     case noDesktopDirectory
     case cannotAddVideoInput
+    case cannotAddAudioInput
     case startWritingFailed(String)
     case finishWritingFailed(String)
 
@@ -15,6 +16,8 @@ enum RecordingError: LocalizedError {
             return "Could not find the Desktop folder."
         case .cannotAddVideoInput:
             return "Could not configure the video encoder."
+        case .cannotAddAudioInput:
+            return "Could not configure the audio encoder."
         case .startWritingFailed(let detail):
             return "Could not start recording: \(detail)"
         case .finishWritingFailed(let detail):
@@ -32,10 +35,12 @@ final class RecordingController: ObservableObject {
     private let queue = DispatchQueue(label: "com.nilpatel.NLRecorder.recording")
     private var assetWriter: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
+    private var audioInput: AVAssetWriterInput?
     private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var outputURL: URL?
     private var sessionStarted = false
     private var isRecordingOnQueue = false
+    private var appendFailureReported = false
     private var durationTimer: Timer?
     private var recordingStartTime: Date?
 
@@ -47,7 +52,13 @@ final class RecordingController: ObservableObject {
 
     func append(_ sampleBuffer: CMSampleBuffer) {
         queue.async { [weak self] in
-            self?.appendOnQueue(sampleBuffer)
+            self?.appendVideoOnQueue(sampleBuffer)
+        }
+    }
+
+    func appendAudio(_ sampleBuffer: CMSampleBuffer) {
+        queue.async { [weak self] in
+            self?.appendAudioOnQueue(sampleBuffer)
         }
     }
 
@@ -73,6 +84,7 @@ final class RecordingController: ObservableObject {
             let evenHeight = height - (height % 2)
 
             let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+            //encoder quality settings
             let settings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
                 AVVideoWidthKey: evenWidth,
@@ -101,6 +113,21 @@ final class RecordingController: ObservableObject {
                 ]
             )
 
+            let audioSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 48_000,
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: 128_000,
+            ]
+            let audio = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+            audio.expectsMediaDataInRealTime = true
+
+            var audioInputToUse: AVAssetWriterInput?
+            if writer.canAdd(audio) {
+                writer.add(audio)
+                audioInputToUse = audio
+            }
+
             guard writer.startWriting() else {
                 let detail = writer.error?.localizedDescription ?? "Unknown error"
                 throw RecordingError.startWritingFailed(detail)
@@ -108,9 +135,11 @@ final class RecordingController: ObservableObject {
 
             assetWriter = writer
             videoInput = input
+            audioInput = audioInputToUse
             pixelBufferAdaptor = adaptor
             outputURL = url
             sessionStarted = false
+            appendFailureReported = false
             isRecordingOnQueue = true
 
             DispatchQueue.main.async { [weak self] in
@@ -128,24 +157,51 @@ final class RecordingController: ObservableObject {
             }
         }
     }
-//appends the sample buffer to the asset writer -> actual recording
-    private func appendOnQueue(_ sampleBuffer: CMSampleBuffer) {
+    private func appendVideoOnQueue(_ sampleBuffer: CMSampleBuffer) {
         guard isRecordingOnQueue,
               let input = videoInput,
               let writer = assetWriter,
               let adaptor = pixelBufferAdaptor,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        if !sessionStarted {
-            let startTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            writer.startSession(atSourceTime: startTime)
-            sessionStarted = true
-        }
+        startSessionIfNeeded(at: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), writer: writer)
 
         guard input.isReadyForMoreMediaData else { return }
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        adaptor.append(pixelBuffer, withPresentationTime: pts)
+        if !adaptor.append(pixelBuffer, withPresentationTime: pts) {
+            reportAppendFailure(writer: writer, mediaType: "video")
+        }
+    }
+
+    private func appendAudioOnQueue(_ sampleBuffer: CMSampleBuffer) {
+        guard isRecordingOnQueue,
+              let input = audioInput,
+              let writer = assetWriter else { return }
+
+        startSessionIfNeeded(at: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), writer: writer)
+
+        guard input.isReadyForMoreMediaData else { return }
+
+        if !input.append(sampleBuffer) {
+            reportAppendFailure(writer: writer, mediaType: "audio")
+        }
+    }
+
+    private func startSessionIfNeeded(at startTime: CMTime, writer: AVAssetWriter) {
+        guard !sessionStarted else { return }
+        writer.startSession(atSourceTime: startTime)
+        sessionStarted = true
+    }
+
+    private func reportAppendFailure(writer: AVAssetWriter, mediaType: String) {
+        guard !appendFailureReported else { return }
+        appendFailureReported = true
+
+        let detail = writer.error?.localizedDescription ?? "Failed to append \(mediaType) sample."
+        DispatchQueue.main.async { [weak self] in
+            self?.errorMessage = detail
+        }
     }
 
     //is whata allows the file to be saved
@@ -156,6 +212,7 @@ final class RecordingController: ObservableObject {
         let savedURL = outputURL
         isRecordingOnQueue = false
         videoInput?.markAsFinished()
+        audioInput?.markAsFinished()
 
         let group = DispatchGroup()
         var finishError: Error?
@@ -173,9 +230,11 @@ final class RecordingController: ObservableObject {
 
         assetWriter = nil
         videoInput = nil
+        audioInput = nil
         pixelBufferAdaptor = nil
         outputURL = nil
         sessionStarted = false
+        appendFailureReported = false
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }

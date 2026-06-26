@@ -46,6 +46,8 @@ cat > "$APP_DIR/Contents/Info.plist" << 'EOF'
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
     <string>NL Recorder needs screen recording access to list window titles and record your screen.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>NL Recorder captures audio from the selected window or display while recording.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>
