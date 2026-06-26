@@ -4,15 +4,40 @@ struct PreviewPanelView: View {
     @ObservedObject var previewController: WindowPreviewController
     let selectedWindow: WindowInfo?
 
+    private var statusColor: Color {
+        if previewController.isRecording {
+            return .red
+        }
+        if previewController.isPreviewActive {
+            return .green
+        }
+        return Color.gray.opacity(0.6)
+    }
+
+    private var statusText: String {
+        if previewController.isRecording {
+            return "Recording"
+        }
+        if previewController.isPreviewActive {
+            return "Previewing"
+        }
+        return "Ready"
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
                 Circle()
-                    .fill(previewController.isPreviewActive ? Color.green : Color.gray.opacity(0.6))
+                    .fill(statusColor)
                     .frame(width: 8, height: 8)
-                Text(previewController.isPreviewActive ? "Previewing" : "Ready")
+                Text(statusText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if previewController.isRecording {
+                    Text(formattedDuration(previewController.recordingDuration))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
             }
             .padding(.horizontal, 16)
@@ -105,16 +130,27 @@ struct PreviewPanelView: View {
 
     private var timelineBar: some View {
         GeometryReader { geometry in
+            let progress = min(previewController.recordingDuration / 120, 1)
+            let fillWidth = previewController.isRecording ? geometry.size.width * progress : 0
+
             ZStack(alignment: .leading) {
                 Capsule()
                     .fill(Color(nsColor: .separatorColor).opacity(0.4))
                 Capsule()
-                    .fill(Color.accentColor.opacity(0.5))
-                    .frame(width: 0)
+                    .fill(Color.red.opacity(0.6))
+                    .frame(width: fillWidth)
+                    .animation(.linear(duration: 0.1), value: previewController.recordingDuration)
             }
             .frame(height: 4)
             .frame(maxWidth: geometry.size.width)
         }
         .frame(height: 4)
+    }
+
+    private func formattedDuration(_ duration: TimeInterval) -> String {
+        let totalSeconds = Int(duration)
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        return String(format: "%d:%02d", minutes, seconds)
     }
 }

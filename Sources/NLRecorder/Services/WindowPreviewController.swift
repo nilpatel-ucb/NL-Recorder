@@ -10,31 +10,86 @@ final class WindowPreviewController: ObservableObject {
     @Published private(set) var isPreviewActive = false
     @Published private(set) var errorMessage: String?
 
+    let recordingController = RecordingController()
+
     private var stream: SCStream?
     private var streamOutput: StreamOutputHandler?
     private var selectedWindow: WindowInfo?
+    private var streamWidth = 0
+    private var streamHeight = 0
+    private var cancellables = Set<AnyCancellable>()
+
+    init() {
+        recordingController.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
+    }
+
+    var isRecording: Bool {
+        recordingController.isRecording
+    }
+
+    var recordingDuration: TimeInterval {
+        recordingController.recordingDuration
+    }
 
     func updateSelectedWindow(_ window: WindowInfo?) {
         guard window?.id != selectedWindow?.id else { return }
 
-        selectedWindow = window
-
-        if let window {
-            Task {
-                await restartPreview(for: window)
+        Task {
+            if recordingController.isRecording {
+                await stopRecording()
             }
-        } else {
-            stopPreview()
+
+            selectedWindow = window
+
+            if let window {
+                await restartPreview(for: window)
+            } else {
+                await stopPreview()
+            }
         }
     }
 
     func shutdown() {
-        stopPreview()
-        selectedWindow = nil
+        Task {
+            if recordingController.isRecording {
+                await stopRecording()
+            }
+            await stopPreview()
+            selectedWindow = nil
+        }
+    }
+
+//runs when user clicks record button
+    func startRecording() {
+        guard isPreviewActive, streamWidth > 0, streamHeight > 0 else { return }
+        recordingController.startRecording(width: streamWidth, height: streamHeight)
+    }
+
+    func stopRecording() async {
+        guard recordingController.isRecording else { return }
+        _ = await recordingController.stopRecording()
+        if let url = recordingController.lastSavedURL {
+            RecordingAlert.showSavedRecording(at: url)
+        }
+    }
+
+    func toggleRecording() {
+        if isRecording {
+            Task {
+                await stopRecording()
+            }
+        } else {
+            startRecording()
+        }
     }
 
     private func restartPreview(for window: WindowInfo) async {
-        stopPreview()
+        await stopPreview()
         errorMessage = nil
 
         do {
@@ -49,11 +104,18 @@ final class WindowPreviewController: ObservableObject {
             }
 
             let filter = SCContentFilter(desktopIndependentWindow: scWindow)
-            let configuration = makeStreamConfiguration(for: window)
-
-            let handler = StreamOutputHandler { [weak self] image in
-                self?.previewImage = image
-            }
+            let configuration = makeStreamConfiguration(for: filter, scWindow: scWindow)
+            streamWidth = configuration.width
+            streamHeight = configuration.height
+//handles the output of the stream, image and sample buffer used both by preview and recording
+            let handler = StreamOutputHandler(
+                onFrame: { [weak self] image in
+                    self?.previewImage = image
+                },
+                onSampleBuffer: { [weak self] sampleBuffer in
+                    self?.recordingController.append(sampleBuffer)
+                }
+            )
             streamOutput = handler
 
             let newStream = SCStream(filter: filter, configuration: configuration, delegate: nil)
@@ -69,28 +131,60 @@ final class WindowPreviewController: ObservableObject {
         }
     }
 
-    private func stopPreview() {
+    private func stopPreview() async {
+        if recordingController.isRecording {
+            await stopRecording()
+        }
+
         if let stream {
-            stream.stopCapture()
+            try? await stream.stopCapture()
         }
         stream = nil
         streamOutput = nil
         previewImage = nil
         isPreviewActive = false
+        streamWidth = 0
+        streamHeight = 0
     }
 
-    private func makeStreamConfiguration(for window: WindowInfo) -> SCStreamConfiguration {
+    private func makeStreamConfiguration(for filter: SCContentFilter, scWindow: SCWindow) -> SCStreamConfiguration {
         let configuration = SCStreamConfiguration()
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
         configuration.showsCursor = true
-        configuration.scalesToFit = true
+        configuration.scalesToFit = false
+        configuration.queueDepth = 6
 
-        let maxWidth: CGFloat = 1920
-        let scale = min(1, maxWidth / max(window.bounds.width, 1))
-        configuration.width = Int(window.bounds.width * scale)
-        configuration.height = Int(window.bounds.height * scale)
+        if #available(macOS 14.0, *) {
+            configuration.captureResolution = .best
+        }
+
+        let (nativeW, nativeH) = maxCapturePixelSize(filter: filter, scWindow: scWindow)
+        let width = Int(nativeW)
+        let height = Int(nativeH)
+        configuration.width = width - (width % 2)
+        configuration.height = height - (height % 2)
 
         return configuration
+    }
+
+    private func maxCapturePixelSize(filter: SCContentFilter, scWindow: SCWindow) -> (CGFloat, CGFloat) {
+        if #available(macOS 14.0, *) {
+            let width = CGFloat(filter.contentRect.width) * CGFloat(filter.pointPixelScale)
+            let height = CGFloat(filter.contentRect.height) * CGFloat(filter.pointPixelScale)
+            return (width, height)
+        }
+
+        let frame = scWindow.frame
+        let scale = backingScaleFactor(for: frame)
+        return (frame.width * scale, frame.height * scale)
+    }
+
+    private func backingScaleFactor(for frame: CGRect) -> CGFloat {
+        let center = CGPoint(x: frame.midX, y: frame.midY)
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(center) }) {
+            return screen.backingScaleFactor
+        }
+        return NSScreen.main?.backingScaleFactor ?? 2.0
     }
 
     private func humanReadableError(_ error: Error) -> String {
@@ -100,5 +194,19 @@ final class WindowPreviewController: ObservableObject {
                 + "toggle it off and on if you recently rebuilt the app, then quit (⌘Q) and reopen."
         }
         return error.localizedDescription
+    }
+}
+
+enum RecordingAlert {
+    static func showSavedRecording(at url: URL) {
+        let alert = NSAlert()
+        alert.messageText = "Recording saved"
+        alert.informativeText = url.path
+        alert.addButton(withTitle: "Open in Finder")
+        alert.addButton(withTitle: "OK")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
     }
 }

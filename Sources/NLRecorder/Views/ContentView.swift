@@ -26,7 +26,11 @@ struct ContentView: View {
 
             InputBarView(
                 prompt: $prompt,
-                isPreviewActive: previewController.isPreviewActive
+                isPreviewActive: previewController.isPreviewActive,
+                isRecording: previewController.isRecording,
+                onRecordToggle: {
+                    previewController.toggleRecording()
+                }
             )
         }
         .frame(width: 860, height: 520)
