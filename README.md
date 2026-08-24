@@ -2,13 +2,13 @@
 
 A macOS screen recorder you talk to. Type what to record; it picks the window, audio, and mic, then writes a file to the Desktop.
 
-Built because OBS and system capture make recording a setup job: menus, sources, audio routing, then a silent file. Goal is setup from ~5 minutes to ~10 seconds for people who just want the thing on screen, with audio, saved.
+![NL Recorder](Pictures/NL-Recorder%20Demo%20pic.png)
 
-No account. Local only. Stop is the **■ Stop** button, not language.
+Built because OBS and system capture make recording a setup job: menus, sources, audio routing, then a silent file. Goal is setup from ~5 minutes to ~10 seconds for people who just want the thing on screen, with audio, saved.
 
 ## How it works
 
-One 860×520 window: live window/display list on the left, preview on the right, prompt bar at the bottom.
+A simple UI with a singular window and a prompt box on the bottom. 
 
 1. ScreenCaptureKit lists on-screen windows and displays (refreshes on focus).
 2. The prompt plus that catalog goes to a local [Ollama](https://ollama.com) model (`llama3.2` preferred). The model returns JSON: target window/display, video on/off, system audio on/off, mic on/off.
