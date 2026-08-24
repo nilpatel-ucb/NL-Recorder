@@ -2,7 +2,7 @@
 
 A macOS screen recorder you talk to. Type what to record; it picks the window, audio, and mic, then writes a file to the Desktop.
 
-![NL Recorder](Pictures/NL-Recorder%20Demo%20pic.png)
+NL Recorder
 
 Built because OBS and system capture make recording a setup job: menus, sources, audio routing, then a silent file. Goal is setup from ~5 minutes to ~10 seconds for people who just want the thing on screen, with audio, saved.
 
