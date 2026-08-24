@@ -12,6 +12,7 @@ final class WindowPreviewController: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published var isSystemAudioEnabled = true
     @Published var isMicrophoneEnabled = false
+    @Published var includeVideo = true
 
     let recordingController = RecordingController()
 
@@ -103,6 +104,54 @@ final class WindowPreviewController: ObservableObject {
         }
     }
 
+    func prepareCapture(
+        selection: CaptureSelection,
+        window: WindowInfo?,
+        display: DisplayInfo?,
+        includeVideo video: Bool,
+        includeSystemAudio systemAudio: Bool,
+        includeMicrophone microphone: Bool
+    ) async -> Bool {
+        guard !isRecording else { return false }
+
+        if microphone {
+            let granted = await MicrophonePermission.requestMicrophoneAccess()
+            if !granted {
+                isMicrophoneEnabled = false
+                errorMessage = "Microphone permission is required. Enable NL Recorder in System Settings → Privacy & Security → Microphone."
+                return false
+            }
+            isMicrophoneEnabled = true
+        } else {
+            isMicrophoneEnabled = false
+        }
+
+        isSystemAudioEnabled = systemAudio
+        includeVideo = video
+        errorMessage = nil
+
+        activeSelection = selection
+        activeWindow = window
+        activeDisplay = display
+
+        switch selection {
+        case .window:
+            guard let window else {
+                await stopPreview()
+                return false
+            }
+            await restartPreview(for: window)
+        case .display:
+            guard let display else {
+                await stopPreview()
+                return false
+            }
+            await restartPreview(for: display)
+        }
+
+        return isPreviewActive
+    }
+
     func shutdown() {
         Task {
             if recordingController.isRecording {
@@ -120,6 +169,7 @@ final class WindowPreviewController: ObservableObject {
         recordingController.startRecording(
             width: streamWidth,
             height: streamHeight,
+            includeVideo: includeVideo,
             includeSystemAudio: isSystemAudioEnabled,
             includeMicrophone: isMicrophoneEnabled
         )
@@ -139,6 +189,7 @@ final class WindowPreviewController: ObservableObject {
                 await stopRecording()
             }
         } else {
+            includeVideo = true
             startRecording()
         }
     }

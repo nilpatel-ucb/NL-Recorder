@@ -19,6 +19,10 @@ final class WindowEnumerator: ObservableObject {
         }
     }
 
+    func refreshAndWait() async {
+        await refreshAsync()
+    }
+
     func select(_ window: WindowInfo) {
         selection = .window(window.id)
     }

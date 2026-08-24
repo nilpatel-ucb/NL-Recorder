@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var windowEnumerator = WindowEnumerator()
     @StateObject private var previewController = WindowPreviewController()
+    @StateObject private var commandExecutor = CommandExecutor()
     @State private var prompt = ""
 
     var body: some View {
@@ -27,10 +28,25 @@ struct ContentView: View {
 
             InputBarView(
                 prompt: $prompt,
+                statusMessage: commandExecutor.statusMessage,
+                statusIsError: commandExecutor.statusIsError,
+                isInterpreting: commandExecutor.isInterpreting,
                 isPreviewActive: previewController.isPreviewActive,
                 isRecording: previewController.isRecording,
                 isSystemAudioEnabled: previewController.isSystemAudioEnabled,
                 isMicrophoneEnabled: previewController.isMicrophoneEnabled,
+                onSubmit: {
+                    Task {
+                        let started = await commandExecutor.submit(
+                            prompt: prompt,
+                            enumerator: windowEnumerator,
+                            previewController: previewController
+                        )
+                        if started {
+                            prompt = ""
+                        }
+                    }
+                },
                 onSystemAudioToggle: {
                     previewController.setSystemAudioEnabled(!previewController.isSystemAudioEnabled)
                 },

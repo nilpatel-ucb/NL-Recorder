@@ -25,6 +25,32 @@ You only need Xcode installed for the Swift compiler — you don't need to open 
 
 - macOS 13 Ventura or later
 - Xcode Command Line Tools (or full Xcode) for `swift build`
+- [Ollama](https://ollama.com) with a local model (one-time)
+
+## Natural language (Ollama)
+
+Type what to record in the input bar and press Enter. NL Recorder sends that sentence, plus the live window list, to a local Ollama model. You never type a prompt into Ollama yourself.
+
+**One-time setup:**
+
+```bash
+brew install ollama
+ollama pull llama3.2
+```
+
+Or install [Ollama.app](https://ollama.com/download). After that, daily use does not need a terminal. If Ollama is not running when you press Enter, NL Recorder starts it.
+
+Examples:
+
+- `record the mclaren youtube video`
+- `record the chrome tab about transpose`
+- `record safari with my mic`
+- `record my screen silently`
+- `record only the audio of the mclaren youtube video`
+
+Stopping is the **■ Stop** button, not language.
+
+If you see “Install Ollama, then pull llama3.2”, the app could not reach `http://127.0.0.1:11434` and could not launch Ollama.
 
 ## Developer run (Terminal)
 
@@ -36,7 +62,7 @@ This works for quick testing but behaves less like a normal Mac app (Dock / ⌘T
 
 ## Permissions
 
-NL Recorder needs **Screen Recording** permission to show window titles and record the screen.
+NL Recorder needs **Screen Recording** permission to show window titles and record the screen. Microphone permission is requested only if you ask for the mic (or turn the mic toggle on).
 
 On first launch, macOS should prompt you. If not:
 
@@ -59,13 +85,12 @@ If NL Recorder is missing from the list, run the app once from the project folde
 
 After granting permission, rebuild only if you changed code: `./scripts/build-app.sh`
 
-## Phase A (current)
+## Current
 
 - Fixed 860×520 window
-- Scrollable sidebar listing open windows (app name, truncated title, placeholder thumbnail)
-- Manual window selection with checkmark highlight
-- Window list refreshes when the app gains focus
-- Preview placeholder and input bar (recording wired in Phase B)
+- Sidebar of displays and windows
+- Live preview, system audio, microphone, and recording to Desktop
+- Natural-language start via local Ollama; Stop button to finish
 
 ## To Build
 Run -> chmod +x build-app.sh

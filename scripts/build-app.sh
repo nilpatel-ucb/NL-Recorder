@@ -50,6 +50,11 @@ cat > "$APP_DIR/Contents/Info.plist" << 'EOF'
     <string>NL Recorder captures audio from the selected window or display while recording.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>NL Recorder captures your microphone when the mic toggle is enabled.</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>

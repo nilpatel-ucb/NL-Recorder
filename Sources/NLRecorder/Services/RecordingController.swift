@@ -5,6 +5,7 @@ import Foundation
 
 enum RecordingError: LocalizedError {
     case noDesktopDirectory
+    case nothingToRecord
     case cannotAddVideoInput
     case cannotAddAudioInput
     case startWritingFailed(String)
@@ -14,6 +15,8 @@ enum RecordingError: LocalizedError {
         switch self {
         case .noDesktopDirectory:
             return "Could not find the Desktop folder."
+        case .nothingToRecord:
+            return "Nothing to record. Enable video, window audio, or the microphone."
         case .cannotAddVideoInput:
             return "Could not configure the video encoder."
         case .cannotAddAudioInput:
@@ -48,6 +51,7 @@ final class RecordingController: ObservableObject {
     func startRecording(
         width: Int,
         height: Int,
+        includeVideo: Bool = true,
         includeSystemAudio: Bool,
         includeMicrophone: Bool
     ) {
@@ -55,6 +59,7 @@ final class RecordingController: ObservableObject {
             self?.startRecordingOnQueue(
                 width: width,
                 height: height,
+                includeVideo: includeVideo,
                 includeSystemAudio: includeSystemAudio,
                 includeMicrophone: includeMicrophone
             )
@@ -91,48 +96,59 @@ final class RecordingController: ObservableObject {
     private func startRecordingOnQueue(
         width: Int,
         height: Int,
+        includeVideo: Bool,
         includeSystemAudio: Bool,
         includeMicrophone: Bool
     ) {
         guard !isRecordingOnQueue else { return }
 
         do {
-            let url = try makeOutputURL()
+            if !includeVideo && !includeSystemAudio && !includeMicrophone {
+                throw RecordingError.nothingToRecord
+            }
+
+            let url = try makeOutputURL(includeVideo: includeVideo)
             if FileManager.default.fileExists(atPath: url.path) {
                 try FileManager.default.removeItem(at: url)
             }
 
-            let evenWidth = width - (width % 2)
-            let evenHeight = height - (height % 2)
+            let evenWidth = max(width - (width % 2), 2)
+            let evenHeight = max(height - (height % 2), 2)
+            let fileType: AVFileType = includeVideo ? .mp4 : .m4a
+            let writer = try AVAssetWriter(outputURL: url, fileType: fileType)
 
-            let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-            let settings: [String: Any] = [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: evenWidth,
-                AVVideoHeightKey: evenHeight,
-                AVVideoCompressionPropertiesKey: [
-                    AVVideoExpectedSourceFrameRateKey: 30,
-                    AVVideoAverageBitRateKey: videoBitrate(forWidth: evenWidth, height: evenHeight),
-                    AVVideoMaxKeyFrameIntervalKey: 30,
-                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-                ],
-            ]
-            let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-            input.expectsMediaDataInRealTime = true
-
-            guard writer.canAdd(input) else {
-                throw RecordingError.cannotAddVideoInput
-            }
-            writer.add(input)
-
-            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-                assetWriterInput: input,
-                sourcePixelBufferAttributes: [
-                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                    kCVPixelBufferWidthKey as String: evenWidth,
-                    kCVPixelBufferHeightKey as String: evenHeight,
+            var videoInputToUse: AVAssetWriterInput?
+            var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+            if includeVideo {
+                let settings: [String: Any] = [
+                    AVVideoCodecKey: AVVideoCodecType.h264,
+                    AVVideoWidthKey: evenWidth,
+                    AVVideoHeightKey: evenHeight,
+                    AVVideoCompressionPropertiesKey: [
+                        AVVideoExpectedSourceFrameRateKey: 30,
+                        AVVideoAverageBitRateKey: videoBitrate(forWidth: evenWidth, height: evenHeight),
+                        AVVideoMaxKeyFrameIntervalKey: 30,
+                        AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                    ],
                 ]
-            )
+                let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+                input.expectsMediaDataInRealTime = true
+
+                guard writer.canAdd(input) else {
+                    throw RecordingError.cannotAddVideoInput
+                }
+                writer.add(input)
+                videoInputToUse = input
+
+                adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                    assetWriterInput: input,
+                    sourcePixelBufferAttributes: [
+                        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                        kCVPixelBufferWidthKey as String: evenWidth,
+                        kCVPixelBufferHeightKey as String: evenHeight,
+                    ]
+                )
+            }
 
             var systemAudioInputToUse: AVAssetWriterInput?
             if includeSystemAudio {
@@ -162,7 +178,7 @@ final class RecordingController: ObservableObject {
             }
 
             assetWriter = writer
-            videoInput = input
+            videoInput = videoInputToUse
             systemAudioInput = systemAudioInputToUse
             microphoneInput = microphoneInputToUse
             pixelBufferAdaptor = adaptor
@@ -314,14 +330,15 @@ final class RecordingController: ObservableObject {
         return max(bitrate, 8_000_000)
     }
 
-    private func makeOutputURL() throws -> URL {
+    private func makeOutputURL(includeVideo: Bool) throws -> URL {
         guard let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first else {
             throw RecordingError.noDesktopDirectory
         }
 
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd_HHmmss"
-        let filename = "recording_\(formatter.string(from: Date())).mp4"
+        let ext = includeVideo ? "mp4" : "m4a"
+        let filename = "recording_\(formatter.string(from: Date())).\(ext)"
         return desktop.appendingPathComponent(filename)
     }
 
