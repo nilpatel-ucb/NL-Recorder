@@ -41,13 +41,15 @@ cat > "$APP_DIR/Contents/Info.plist" << 'EOF'
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>15.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
     <string>NL Recorder needs screen recording access to list window titles and record your screen.</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>NL Recorder captures audio from the selected window or display while recording.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>NL Recorder captures your microphone when the mic toggle is enabled.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>

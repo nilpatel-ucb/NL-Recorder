@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Combine
 import CoreMedia
 import Foundation
@@ -9,12 +10,16 @@ final class WindowPreviewController: ObservableObject {
     @Published private(set) var previewImage: NSImage?
     @Published private(set) var isPreviewActive = false
     @Published private(set) var errorMessage: String?
+    @Published var isSystemAudioEnabled = true
+    @Published var isMicrophoneEnabled = false
 
     let recordingController = RecordingController()
 
     private var stream: SCStream?
     private var streamOutput: StreamOutputHandler?
     private var activeSelection: CaptureSelection?
+    private var activeWindow: WindowInfo?
+    private var activeDisplay: DisplayInfo?
     private var streamWidth = 0
     private var streamHeight = 0
     private var cancellables = Set<AnyCancellable>()
@@ -38,6 +43,35 @@ final class WindowPreviewController: ObservableObject {
         recordingController.recordingDuration
     }
 
+    func setSystemAudioEnabled(_ enabled: Bool) {
+        guard enabled != isSystemAudioEnabled else { return }
+        guard !isRecording else { return }
+
+        isSystemAudioEnabled = enabled
+        applyAudioSettings()
+    }
+
+    func setMicrophoneEnabled(_ enabled: Bool) {
+        guard enabled != isMicrophoneEnabled else { return }
+        guard !isRecording else { return }
+
+        if enabled {
+            Task {
+                let granted = await MicrophonePermission.requestMicrophoneAccess()
+                if granted {
+                    isMicrophoneEnabled = true
+                    applyAudioSettings()
+                } else {
+                    isMicrophoneEnabled = false
+                    errorMessage = "Microphone permission is required. Enable NL Recorder in System Settings → Privacy & Security → Microphone."
+                }
+            }
+        } else {
+            isMicrophoneEnabled = false
+            applyAudioSettings()
+        }
+    }
+
     func updateSelection(_ selection: CaptureSelection?, window: WindowInfo?, display: DisplayInfo?) {
         guard selection != activeSelection else { return }
 
@@ -47,6 +81,8 @@ final class WindowPreviewController: ObservableObject {
             }
 
             activeSelection = selection
+            activeWindow = window
+            activeDisplay = display
 
             switch selection {
             case .window(let id):
@@ -74,12 +110,19 @@ final class WindowPreviewController: ObservableObject {
             }
             await stopPreview()
             activeSelection = nil
+            activeWindow = nil
+            activeDisplay = nil
         }
     }
 
     func startRecording() {
         guard isPreviewActive, streamWidth > 0, streamHeight > 0 else { return }
-        recordingController.startRecording(width: streamWidth, height: streamHeight)
+        recordingController.startRecording(
+            width: streamWidth,
+            height: streamHeight,
+            includeSystemAudio: isSystemAudioEnabled,
+            includeMicrophone: isMicrophoneEnabled
+        )
     }
 
     func stopRecording() async {
@@ -97,6 +140,25 @@ final class WindowPreviewController: ObservableObject {
             }
         } else {
             startRecording()
+        }
+    }
+
+    private func applyAudioSettings() {
+        guard isPreviewActive, !isRecording else { return }
+
+        Task {
+            switch activeSelection {
+            case .window:
+                if let window = activeWindow {
+                    await restartPreview(for: window)
+                }
+            case .display:
+                if let display = activeDisplay {
+                    await restartPreview(for: display)
+                }
+            case nil:
+                break
+            }
         }
     }
 
@@ -166,15 +228,23 @@ final class WindowPreviewController: ObservableObject {
             onSampleBuffer: { [weak self] sampleBuffer in
                 self?.recordingController.append(sampleBuffer)
             },
-            onAudioSampleBuffer: { [weak self] sampleBuffer in
-                self?.recordingController.appendAudio(sampleBuffer)
-            }
+            onSystemAudioSampleBuffer: isSystemAudioEnabled ? { [weak self] sampleBuffer in
+                self?.recordingController.appendSystemAudio(sampleBuffer)
+            } : nil,
+            onMicrophoneSampleBuffer: isMicrophoneEnabled ? { [weak self] sampleBuffer in
+                self?.recordingController.appendMicrophone(sampleBuffer)
+            } : nil
         )
         streamOutput = handler
 
         let newStream = SCStream(filter: filter, configuration: configuration, delegate: nil)
         try newStream.addStreamOutput(handler, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
-        try newStream.addStreamOutput(handler, type: .audio, sampleHandlerQueue: .global(qos: .userInitiated))
+        if isSystemAudioEnabled {
+            try newStream.addStreamOutput(handler, type: .audio, sampleHandlerQueue: .global(qos: .userInitiated))
+        }
+        if isMicrophoneEnabled {
+            try newStream.addStreamOutput(handler, type: .microphone, sampleHandlerQueue: .global(qos: .userInitiated))
+        }
         try await newStream.startCapture()
 
         stream = newStream
@@ -203,14 +273,15 @@ final class WindowPreviewController: ObservableObject {
         configuration.showsCursor = true
         configuration.scalesToFit = false
         configuration.queueDepth = 6
-        configuration.capturesAudio = true
+        configuration.capturesAudio = isSystemAudioEnabled
+        configuration.captureMicrophone = isMicrophoneEnabled
+        if isMicrophoneEnabled {
+            configuration.microphoneCaptureDeviceID = AVCaptureDevice.default(for: .audio)?.uniqueID
+        }
         configuration.excludesCurrentProcessAudio = true
         configuration.sampleRate = 48_000
         configuration.channelCount = 2
-
-        if #available(macOS 14.0, *) {
-            configuration.captureResolution = .best
-        }
+        configuration.captureResolution = .best
 
         let (nativeW, nativeH) = maxCapturePixelSize(filter: filter, fallbackBounds: fallbackBounds)
         let width = Int(nativeW)
@@ -222,22 +293,9 @@ final class WindowPreviewController: ObservableObject {
     }
 
     private func maxCapturePixelSize(filter: SCContentFilter, fallbackBounds: CGRect) -> (CGFloat, CGFloat) {
-        if #available(macOS 14.0, *) {
-            let width = CGFloat(filter.contentRect.width) * CGFloat(filter.pointPixelScale)
-            let height = CGFloat(filter.contentRect.height) * CGFloat(filter.pointPixelScale)
-            return (width, height)
-        }
-
-        let scale = backingScaleFactor(for: fallbackBounds)
-        return (fallbackBounds.width * scale, fallbackBounds.height * scale)
-    }
-
-    private func backingScaleFactor(for frame: CGRect) -> CGFloat {
-        let center = CGPoint(x: frame.midX, y: frame.midY)
-        if let screen = NSScreen.screens.first(where: { $0.frame.contains(center) }) {
-            return screen.backingScaleFactor
-        }
-        return NSScreen.main?.backingScaleFactor ?? 2.0
+        let width = CGFloat(filter.contentRect.width) * CGFloat(filter.pointPixelScale)
+        let height = CGFloat(filter.contentRect.height) * CGFloat(filter.pointPixelScale)
+        return (width, height)
     }
 
     private func handlePreviewError(_ error: Error) {

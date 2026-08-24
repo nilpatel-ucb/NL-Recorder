@@ -35,7 +35,8 @@ final class RecordingController: ObservableObject {
     private let queue = DispatchQueue(label: "com.nilpatel.NLRecorder.recording")
     private var assetWriter: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
-    private var audioInput: AVAssetWriterInput?
+    private var systemAudioInput: AVAssetWriterInput?
+    private var microphoneInput: AVAssetWriterInput?
     private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var outputURL: URL?
     private var sessionStarted = false
@@ -44,9 +45,19 @@ final class RecordingController: ObservableObject {
     private var durationTimer: Timer?
     private var recordingStartTime: Date?
 
-    func startRecording(width: Int, height: Int) {
+    func startRecording(
+        width: Int,
+        height: Int,
+        includeSystemAudio: Bool,
+        includeMicrophone: Bool
+    ) {
         queue.async { [weak self] in
-            self?.startRecordingOnQueue(width: width, height: height)
+            self?.startRecordingOnQueue(
+                width: width,
+                height: height,
+                includeSystemAudio: includeSystemAudio,
+                includeMicrophone: includeMicrophone
+            )
         }
     }
 
@@ -56,9 +67,15 @@ final class RecordingController: ObservableObject {
         }
     }
 
-    func appendAudio(_ sampleBuffer: CMSampleBuffer) {
+    func appendSystemAudio(_ sampleBuffer: CMSampleBuffer) {
         queue.async { [weak self] in
-            self?.appendAudioOnQueue(sampleBuffer)
+            self?.appendSystemAudioOnQueue(sampleBuffer)
+        }
+    }
+
+    func appendMicrophone(_ sampleBuffer: CMSampleBuffer) {
+        queue.async { [weak self] in
+            self?.appendMicrophoneOnQueue(sampleBuffer)
         }
     }
 
@@ -71,7 +88,12 @@ final class RecordingController: ObservableObject {
         }
     }
 
-    private func startRecordingOnQueue(width: Int, height: Int) {
+    private func startRecordingOnQueue(
+        width: Int,
+        height: Int,
+        includeSystemAudio: Bool,
+        includeMicrophone: Bool
+    ) {
         guard !isRecordingOnQueue else { return }
 
         do {
@@ -84,7 +106,6 @@ final class RecordingController: ObservableObject {
             let evenHeight = height - (height % 2)
 
             let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-            //encoder quality settings
             let settings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
                 AVVideoWidthKey: evenWidth,
@@ -113,19 +134,26 @@ final class RecordingController: ObservableObject {
                 ]
             )
 
-            let audioSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: 48_000,
-                AVNumberOfChannelsKey: 2,
-                AVEncoderBitRateKey: 128_000,
-            ]
-            let audio = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-            audio.expectsMediaDataInRealTime = true
+            var systemAudioInputToUse: AVAssetWriterInput?
+            if includeSystemAudio {
+                let systemAudio = AVAssetWriterInput(mediaType: .audio, outputSettings: aacAudioOutputSettings())
+                systemAudio.expectsMediaDataInRealTime = true
+                guard writer.canAdd(systemAudio) else {
+                    throw RecordingError.cannotAddAudioInput
+                }
+                writer.add(systemAudio)
+                systemAudioInputToUse = systemAudio
+            }
 
-            var audioInputToUse: AVAssetWriterInput?
-            if writer.canAdd(audio) {
-                writer.add(audio)
-                audioInputToUse = audio
+            var microphoneInputToUse: AVAssetWriterInput?
+            if includeMicrophone {
+                let mic = AVAssetWriterInput(mediaType: .audio, outputSettings: aacAudioOutputSettings())
+                mic.expectsMediaDataInRealTime = true
+                guard writer.canAdd(mic) else {
+                    throw RecordingError.cannotAddAudioInput
+                }
+                writer.add(mic)
+                microphoneInputToUse = mic
             }
 
             guard writer.startWriting() else {
@@ -135,7 +163,8 @@ final class RecordingController: ObservableObject {
 
             assetWriter = writer
             videoInput = input
-            audioInput = audioInputToUse
+            systemAudioInput = systemAudioInputToUse
+            microphoneInput = microphoneInputToUse
             pixelBufferAdaptor = adaptor
             outputURL = url
             sessionStarted = false
@@ -157,6 +186,7 @@ final class RecordingController: ObservableObject {
             }
         }
     }
+
     private func appendVideoOnQueue(_ sampleBuffer: CMSampleBuffer) {
         guard isRecordingOnQueue,
               let input = videoInput,
@@ -174,9 +204,18 @@ final class RecordingController: ObservableObject {
         }
     }
 
-    private func appendAudioOnQueue(_ sampleBuffer: CMSampleBuffer) {
+    private func aacAudioOutputSettings() -> [String: Any] {
+        [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 48_000,
+            AVNumberOfChannelsKey: 2,
+            AVEncoderBitRateKey: 128_000,
+        ]
+    }
+
+    private func appendSystemAudioOnQueue(_ sampleBuffer: CMSampleBuffer) {
         guard isRecordingOnQueue,
-              let input = audioInput,
+              let input = systemAudioInput,
               let writer = assetWriter else { return }
 
         startSessionIfNeeded(at: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), writer: writer)
@@ -184,7 +223,21 @@ final class RecordingController: ObservableObject {
         guard input.isReadyForMoreMediaData else { return }
 
         if !input.append(sampleBuffer) {
-            reportAppendFailure(writer: writer, mediaType: "audio")
+            reportAppendFailure(writer: writer, mediaType: "system audio")
+        }
+    }
+
+    private func appendMicrophoneOnQueue(_ sampleBuffer: CMSampleBuffer) {
+        guard isRecordingOnQueue,
+              let input = microphoneInput,
+              let writer = assetWriter else { return }
+
+        startSessionIfNeeded(at: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), writer: writer)
+
+        guard input.isReadyForMoreMediaData else { return }
+
+        if !input.append(sampleBuffer) {
+            reportAppendFailure(writer: writer, mediaType: "microphone")
         }
     }
 
@@ -204,15 +257,14 @@ final class RecordingController: ObservableObject {
         }
     }
 
-    //is whata allows the file to be saved
-    //writes the mp4 and metadata. 
     private func finishRecordingOnQueue() -> URL? {
         guard isRecordingOnQueue else { return nil }
 
         let savedURL = outputURL
         isRecordingOnQueue = false
         videoInput?.markAsFinished()
-        audioInput?.markAsFinished()
+        systemAudioInput?.markAsFinished()
+        microphoneInput?.markAsFinished()
 
         let group = DispatchGroup()
         var finishError: Error?
@@ -230,7 +282,8 @@ final class RecordingController: ObservableObject {
 
         assetWriter = nil
         videoInput = nil
-        audioInput = nil
+        systemAudioInput = nil
+        microphoneInput = nil
         pixelBufferAdaptor = nil
         outputURL = nil
         sessionStarted = false
@@ -253,7 +306,7 @@ final class RecordingController: ObservableObject {
 
         return finishError == nil ? savedURL : nil
     }
-//creates the output url
+
     private func videoBitrate(forWidth width: Int, height: Int) -> Int {
         let pixelCount = width * height
         let fullHDPixels = 1920 * 1080

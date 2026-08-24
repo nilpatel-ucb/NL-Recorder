@@ -66,3 +66,10 @@ After granting permission, rebuild only if you changed code: `./scripts/build-ap
 - Manual window selection with checkmark highlight
 - Window list refreshes when the app gains focus
 - Preview placeholder and input bar (recording wired in Phase B)
+
+## To Build
+Run -> chmod +x build-app.sh
+./build-app.sh
+
+## After Rebuild App asking for permission issue
+Run this command to reset permissions -> tccutil reset ScreenCapture com.nilpatel.NLRecorder

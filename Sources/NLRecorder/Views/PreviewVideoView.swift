@@ -9,6 +9,8 @@ struct PreviewVideoView: NSViewRepresentable {
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.imageAlignment = .alignCenter
         imageView.translatesAutoresizingMaskIntoConstraints = false
+        //setContentHuggingPriority: prevents the image view from getting too big
+        //setContentCompressionResistancePriority: prevents the image view from getting too small
         imageView.setContentHuggingPriority(.defaultLow, for: .horizontal)
         imageView.setContentHuggingPriority(.defaultLow, for: .vertical)
         imageView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)

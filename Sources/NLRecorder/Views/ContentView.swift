@@ -29,6 +29,14 @@ struct ContentView: View {
                 prompt: $prompt,
                 isPreviewActive: previewController.isPreviewActive,
                 isRecording: previewController.isRecording,
+                isSystemAudioEnabled: previewController.isSystemAudioEnabled,
+                isMicrophoneEnabled: previewController.isMicrophoneEnabled,
+                onSystemAudioToggle: {
+                    previewController.setSystemAudioEnabled(!previewController.isSystemAudioEnabled)
+                },
+                onMicrophoneToggle: {
+                    previewController.setMicrophoneEnabled(!previewController.isMicrophoneEnabled)
+                },
                 onRecordToggle: {
                     previewController.toggleRecording()
                 }

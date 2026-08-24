@@ -7,17 +7,20 @@ import ScreenCaptureKit
 final class StreamOutputHandler: NSObject, SCStreamOutput {
     private let onFrame: @MainActor (NSImage) -> Void
     private let onSampleBuffer: ((CMSampleBuffer) -> Void)?
-    private let onAudioSampleBuffer: ((CMSampleBuffer) -> Void)?
+    private let onSystemAudioSampleBuffer: ((CMSampleBuffer) -> Void)?
+    private let onMicrophoneSampleBuffer: ((CMSampleBuffer) -> Void)?
     private let ciContext = CIContext()
 
     init(
         onFrame: @escaping @MainActor (NSImage) -> Void,
         onSampleBuffer: ((CMSampleBuffer) -> Void)? = nil,
-        onAudioSampleBuffer: ((CMSampleBuffer) -> Void)? = nil
+        onSystemAudioSampleBuffer: ((CMSampleBuffer) -> Void)? = nil,
+        onMicrophoneSampleBuffer: ((CMSampleBuffer) -> Void)? = nil
     ) {
         self.onFrame = onFrame
         self.onSampleBuffer = onSampleBuffer
-        self.onAudioSampleBuffer = onAudioSampleBuffer
+        self.onSystemAudioSampleBuffer = onSystemAudioSampleBuffer
+        self.onMicrophoneSampleBuffer = onMicrophoneSampleBuffer
     }
 
     func stream(
@@ -35,8 +38,10 @@ final class StreamOutputHandler: NSObject, SCStreamOutput {
                 onFrame(image)
             }
         case .audio:
-            onAudioSampleBuffer?(sampleBuffer)
-        default:
+            onSystemAudioSampleBuffer?(sampleBuffer)
+        case .microphone:
+            onMicrophoneSampleBuffer?(sampleBuffer)
+        @unknown default:
             break
         }
     }
