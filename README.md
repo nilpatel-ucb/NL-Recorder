@@ -1,100 +1,53 @@
 # NL Recorder
 
-A minimalist macOS screen recorder controlled by natural language.
+A macOS screen recorder you talk to. Type what to record; it picks the window, audio, and mic, then writes a file to the Desktop.
 
-## Easiest way to run (no Xcode)
+Built because OBS and system capture make recording a setup job: menus, sources, audio routing, then a silent file. Goal is setup from ~5 minutes to ~10 seconds for people who just want the thing on screen, with audio, saved.
 
-One-time setup from Terminal:
+No account. Local only. Stop is the **■ Stop** button, not language.
+
+## How it works
+
+One 860×520 window: live window/display list on the left, preview on the right, prompt bar at the bottom.
+
+1. ScreenCaptureKit lists on-screen windows and displays (refreshes on focus).
+2. The prompt plus that catalog goes to a local [Ollama](https://ollama.com) model (`llama3.2` preferred). The model returns JSON: target window/display, video on/off, system audio on/off, mic on/off.
+3. Token matching on window titles/apps backs the model if IDs are wrong.
+4. ScreenCaptureKit streams the selected target into a live preview.
+5. **■ Stop** muxes H.264 + AAC via AVFoundation (`AVAssetWriter`) to `~/Desktop/recording_YYYYMMDD_HHMMSS.mp4` (audio-only is `.m4a`). Bitrate scales with resolution; capture is 30 fps at the machine’s native size.
+
+System audio defaults on; mic defaults off unless you ask. Both can be toggled in the bar. Clicking a sidebar item selects it without recording.
+
+SwiftUI + Swift Package Manager. No ffmpeg. Capture and encode are Apple APIs; language is Ollama over `http://127.0.0.1:11434`.
+
+Examples: `record the chrome tab about transpose` · `record safari with my mic` · `record my screen silently` · `record only the audio of the youtube video`.
+
+## Run
+
+macOS 15+, Xcode CLT (for `swift build`), Ollama with a local model.
 
 ```bash
-cd "/Users/nilpatel/Nil Random Projects/nl-recorder"
+brew install ollama
+ollama pull llama3.2
 chmod +x scripts/build-app.sh
 ./scripts/build-app.sh
 open NLRecorder.app
 ```
 
-That creates **`NLRecorder.app`** in the project folder. After that:
+`NLRecorder.app` lands in the project folder. Drag it to Applications if you want. Rebuild after code changes with the same script. `swift run NLRecorder` works for testing but is a worse Mac citizen (Dock / ⌘Tab).
 
-1. **Double-click `NLRecorder.app`** to open it
-2. **Drag it to Applications** (or Desktop) if you want it like any other Mac app
-3. After code changes, run `./scripts/build-app.sh` again to rebuild
-
-You only need Xcode installed for the Swift compiler — you don't need to open Xcode to use the app.
-
-## Requirements
-
-- macOS 13 Ventura or later
-- Xcode Command Line Tools (or full Xcode) for `swift build`
-- [Ollama](https://ollama.com) with a local model (one-time)
-
-## Natural language (Ollama)
-
-Type what to record in the input bar and press Enter. NL Recorder sends that sentence, plus the live window list, to a local Ollama model. You never type a prompt into Ollama yourself.
-
-**One-time setup:**
-
-```bash
-brew install ollama
-ollama pull llama3.2
-```
-
-Or install [Ollama.app](https://ollama.com/download). After that, daily use does not need a terminal. If Ollama is not running when you press Enter, NL Recorder starts it.
-
-Examples:
-
-- `record the mclaren youtube video`
-- `record the chrome tab about transpose`
-- `record safari with my mic`
-- `record my screen silently`
-- `record only the audio of the mclaren youtube video`
-
-Stopping is the **■ Stop** button, not language.
-
-If you see “Install Ollama, then pull llama3.2”, the app could not reach `http://127.0.0.1:11434` and could not launch Ollama.
-
-## Developer run (Terminal)
-
-```bash
-swift run NLRecorder
-```
-
-This works for quick testing but behaves less like a normal Mac app (Dock / ⌘Tab). Prefer `NLRecorder.app` for daily use.
+If Ollama isn’t running when you press Enter, the app starts it. If you see “Install Ollama, then pull llama3.2”, nothing is listening on port 11434.
 
 ## Permissions
 
-NL Recorder needs **Screen Recording** permission to show window titles and record the screen. Microphone permission is requested only if you ask for the mic (or turn the mic toggle on).
+Screen Recording is required for titles and capture. Grant it to **NL Recorder**, not Terminal or Xcode. Mic is requested only if you ask for it or flip the mic toggle.
 
-On first launch, macOS should prompt you. If not:
+Untitled windows in the sidebar means Screen Recording is missing for this binary. Enable it under **System Settings → Privacy & Security → Screen Recording**, then ⌘Q and reopen.
 
-1. Open **System Settings → Privacy & Security → Screen Recording**
-2. Enable **NL Recorder** (not Terminal or Xcode — those are separate apps)
-3. Quit and reopen `NLRecorder.app`
-4. Click away and back to refresh the window list
+Rebuilds can leave a stale grant (toggle looks on, new binary is denied):
 
-## Troubleshooting
+```bash
+tccutil reset ScreenCapture com.nilpatel.NLRecorder
+```
 
-### All windows show "Untitled window"
-
-This means Screen Recording is not granted to **`NLRecorder.app`**. Permission given to Terminal or Xcode does not carry over.
-
-1. Click **Open System Settings** in the orange banner inside the app, or go to Privacy & Security → Screen Recording manually
-2. Turn on **NL Recorder**
-3. Quit the app fully (⌘Q) and reopen it
-
-If NL Recorder is missing from the list, run the app once from the project folder, then check Settings again.
-
-After granting permission, rebuild only if you changed code: `./scripts/build-app.sh`
-
-## Current
-
-- Fixed 860×520 window
-- Sidebar of displays and windows
-- Live preview, system audio, microphone, and recording to Desktop
-- Natural-language start via local Ollama; Stop button to finish
-
-## To Build
-Run -> chmod +x build-app.sh
-./build-app.sh
-
-## After Rebuild App asking for permission issue
-Run this command to reset permissions -> tccutil reset ScreenCapture com.nilpatel.NLRecorder
+Reopen the app, enable **NL Recorder** in Settings, quit, reopen.
